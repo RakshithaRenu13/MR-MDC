@@ -440,7 +440,8 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
     )
 
     def get(row, col):
-        if col >= len(row):
+        """Safely read a positional Excel cell from a pandas row."""
+        if col is None or col < 0 or col >= len(row):
             return ""
         return clean_text(row.iloc[col])
 
@@ -608,9 +609,9 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
         for _, row in sheet.iloc[optional_start:optional_end].iterrows():
             part = get(row, 0)
             desc = get(row, 1)
-            qty = numeric(row.iloc[2])
+            qty = numeric(get(row, 2))
             uom = get(row, 3)
-            price = numeric(row.iloc[4])
+            price = numeric(get(row, 4))
 
             if not part or not desc:
                 continue
@@ -628,7 +629,10 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
                 "Unit Cost": price,
             })
 
-    accessories = pd.DataFrame(accessories)
+    accessories = pd.DataFrame(
+        accessories,
+        columns=["Part Code", "Description", "Default Quantity", "UOM", "Unit Cost"],
+    )
 
     # --------------------------------------------------------
     # SINGLE PHASE PDU'S
@@ -655,10 +659,10 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
             if part.upper() in {"PART NUMBER", "PART NO", "PART CODE"}:
                 continue
 
-            c13 = numeric(row.iloc[2])
-            c19 = numeric(row.iloc[3])
+            c13 = numeric(get(row, 2))
+            c19 = numeric(get(row, 3))
             excel_type = get(row, 4)
-            price = numeric(row.iloc[5])
+            price = numeric(get(row, 5))
 
             if excel_type:
                 current_pdu_type = excel_type.upper()
@@ -816,10 +820,10 @@ def load_multirack_boq():
             # checkboxes, while A/normal numeric rows remain mandatory.
             sno = cell(row, column_map.get("sno"))
             description = cell(row, column_map.get("description"))
-            quantity = numeric(row.iloc[column_map["qty"]])
+            quantity = numeric(cell(row, column_map.get("qty")))
             uom = cell(row, column_map.get("uom"))
             part_code = cell(row, column_map.get("part"))
-            unit_cost = numeric(row.iloc[column_map["cost"]]) if "cost" in column_map else float("nan")
+            unit_cost = numeric(cell(row, column_map.get("cost"))) if "cost" in column_map else float("nan")
 
             if norm(sno) in {"SNO", "SERIALNO", "SERIALNUMBER", "SRNO"}:
                 continue
