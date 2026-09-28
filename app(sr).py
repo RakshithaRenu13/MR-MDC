@@ -440,8 +440,7 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
     )
 
     def get(row, col):
-        """Safely read a positional Excel cell from a pandas row."""
-        if col is None or col < 0 or col >= len(row):
+        if col >= len(row):
             return ""
         return clean_text(row.iloc[col])
 
@@ -483,19 +482,9 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
         block = sheet.iloc[info["start"]:info["end"]]
 
         title_col = info["part"]
-
-        # A workbook can contain fewer rows than the fixed legacy
-        # Single-Rack block boundaries (0:25 / 25:50).  In that case
-        # pandas returns an empty block and block.iloc[0] raises
-        # "single positional indexer is out-of-bounds".
-        # Keep the configuration entry, but safely fall back to its
-        # configuration name and let the component loop remain empty.
-        if block.empty:
+        solution_title = get(block.iloc[0], title_col)
+        if not solution_title:
             solution_title = config_name
-        else:
-            solution_title = get(block.iloc[0], title_col)
-            if not solution_title:
-                solution_title = config_name
 
         solution_title = " ".join(solution_title.split())
         solution_title = solution_title.replace("SOLUTION 1", "")
@@ -510,9 +499,9 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
 
             part = get(row, info["part"])
             desc = get(row, info["desc"])
-            qty = numeric(get(row, info["qty"]))
+            qty = numeric(row.iloc[info["qty"]])
             uom = get(row, info["uom"])
-            price = numeric(get(row, info["price"]))
+            price = numeric(row.iloc[info["price"]])
 
             if not part and not desc:
                 continue
@@ -609,9 +598,9 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
         for _, row in sheet.iloc[optional_start:optional_end].iterrows():
             part = get(row, 0)
             desc = get(row, 1)
-            qty = numeric(get(row, 2))
+            qty = numeric(row.iloc[2])
             uom = get(row, 3)
-            price = numeric(get(row, 4))
+            price = numeric(row.iloc[4])
 
             if not part or not desc:
                 continue
@@ -629,10 +618,7 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
                 "Unit Cost": price,
             })
 
-    accessories = pd.DataFrame(
-        accessories,
-        columns=["Part Code", "Description", "Default Quantity", "UOM", "Unit Cost"],
-    )
+    accessories = pd.DataFrame(accessories)
 
     # --------------------------------------------------------
     # SINGLE PHASE PDU'S
@@ -659,10 +645,10 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
             if part.upper() in {"PART NUMBER", "PART NO", "PART CODE"}:
                 continue
 
-            c13 = numeric(get(row, 2))
-            c19 = numeric(get(row, 3))
+            c13 = numeric(row.iloc[2])
+            c19 = numeric(row.iloc[3])
             excel_type = get(row, 4)
-            price = numeric(get(row, 5))
+            price = numeric(row.iloc[5])
 
             if excel_type:
                 current_pdu_type = excel_type.upper()
@@ -808,22 +794,22 @@ def load_multirack_boq():
             if not meaningful:
                 continue
 
-            # Read the normal S.No./Description/Qty/UOM row first.
-            #
-            # Multirack Excel supports BOTH layouts:
-            #   1) B/C are standalone group-heading rows.
-            #   2) B/C are written directly in the S.No. column for each
-            #      optional component row (the new workbook layout).
-            #
-            # In the new layout, four rows may have S.No. = B and one row
-            # may have S.No. = C. Those rows must become selectable
-            # checkboxes, while A/normal numeric rows remain mandatory.
+            # Group headings are rows containing only the heading, e.g.
+            # B / B - Select Components / C: Optional.
+            if len(meaningful) == 1:
+                group_match = group_re.match(meaningful[0])
+                if group_match:
+                    current_group = group_match.group(1).upper()
+                    suffix = clean_text(group_match.group(2))
+                    current_group_label = f"{current_group} - {suffix}" if suffix else current_group
+                    continue
+
             sno = cell(row, column_map.get("sno"))
             description = cell(row, column_map.get("description"))
-            quantity = numeric(cell(row, column_map.get("qty")))
+            quantity = numeric(row.iloc[column_map["qty"]])
             uom = cell(row, column_map.get("uom"))
             part_code = cell(row, column_map.get("part"))
-            unit_cost = numeric(cell(row, column_map.get("cost"))) if "cost" in column_map else float("nan")
+            unit_cost = numeric(row.iloc[column_map["cost"]]) if "cost" in column_map else float("nan")
 
             if norm(sno) in {"SNO", "SERIALNO", "SERIALNUMBER", "SRNO"}:
                 continue
@@ -832,39 +818,15 @@ def load_multirack_boq():
             if not sno and not description and not part_code:
                 continue
 
-            # Standalone group-heading rows are still supported.
-            if len(meaningful) == 1:
-                group_match = group_re.match(meaningful[0])
-                if group_match:
-                    current_group = group_match.group(1).upper()
-                    suffix = clean_text(group_match.group(2))
-                    current_group_label = (
-                        f"{current_group} - {suffix}" if suffix else current_group
-                    )
-                    continue
-
-            # New Multirack workbook format:
-            # B/C are used instead of serial numbers on the component rows.
-            # A component row therefore carries its own group.
-            sno_group = norm(sno)
-            if sno_group in {"A", "B", "C"}:
-                row_group = sno_group
-                row_group_label = row_group
-                current_group = row_group
-                current_group_label = row_group_label
-            else:
-                row_group = current_group
-                row_group_label = current_group_label
-
             qty_value = float(quantity) if pd.notna(quantity) else 0.0
-            selection_key = f"MR-{number}-{row_group}-{ridx}"
+            selection_key = f"MR-{number}-{current_group}-{ridx}"
 
             component_rows.append({
                 "MDC Type": "Multirack",
                 "Configuration": config_name,
                 "Configuration Title": solution_title,
-                "Group": row_group,
-                "Group Label": row_group_label,
+                "Group": current_group,
+                "Group Label": current_group_label,
                 "S.No.": sno,
                 "Description": description,
                 "Quantity": qty_value,
@@ -939,6 +901,7 @@ defaults = {
     "user_count": 0,
     "session_counted": False,
     "multirack_selected": {},
+    "multirack_qty": {},
 }
 
 for key, value in defaults.items():
@@ -1230,7 +1193,20 @@ def selected_multirack_components():
     }
     is_a = rows["Group"].astype(str).str.upper().eq("A")
     is_selected_optional = rows["Selection Key"].astype(str).isin(selected_keys)
-    return rows[is_a | is_selected_optional].copy()
+    result = rows[is_a | is_selected_optional].copy()
+
+    # B/C quantities are controlled by the UI.  A keeps the quantity from Excel.
+    if not result.empty and st.session_state.multirack_qty:
+        result["Quantity"] = result.apply(
+            lambda r: numeric(
+                st.session_state.multirack_qty.get(
+                    clean_text(r.get("Selection Key")),
+                    r.get("Quantity")
+                )
+            ),
+            axis=1,
+        )
+    return result
 
 
 
@@ -1467,7 +1443,11 @@ def build_sales_boq(bom):
     # MULTIRACK BOQ.xlsx. The pricing columns remain available only in the
     # detailed Excel/PDF export and are intentionally blank.
     if st.session_state.mdc_type == "Multirack":
+        # Final Multirack BOQ contains exactly the selected solution components
+        # (A is always included, B/C only when checked), followed by the
+        # selected PDU and other accessories.  Renumber everything sequentially.
         output_rows = []
+        serial = 1
 
         for _, row in bom.iterrows():
             description = clean_text(row.get("Description"))
@@ -1476,11 +1456,12 @@ def build_sales_boq(bom):
 
             qty = numeric(row.get("Quantity"))
             output_rows.append({
-                "S.No.": clean_text(row.get("S.No.")),
+                "S.No.": serial,
                 "Description": description,
                 "Quantity": float(qty) if pd.notna(qty) else "",
                 "UOM": clean_text(row.get("UOM")) or "EA",
             })
+            serial += 1
 
         return pd.DataFrame(
             output_rows,
@@ -1704,7 +1685,9 @@ def excel_bytes(
     # Single Rack Sales remains compact. Multirack exports use the same
     # detailed columns as the existing cost export, but pricing fields are
     # intentionally blank because the Multirack source has no pricing data.
-    detailed_output = internal or st.session_state.mdc_type == "Multirack"
+    # Sales/customer output is always the requested compact BOQ:
+    # S.No. | Description | Qty | UOM. Internal mode can retain detailed rows.
+    detailed_output = internal
     display_bom = (
         bom
         if detailed_output
@@ -3522,6 +3505,7 @@ with main_left:
             st.session_state.accessory_qty = {}
             st.session_state.pdu_qty = {}
             st.session_state.multirack_selected = {}
+            st.session_state.multirack_qty = {}
             st.session_state.configuration_id = generate_configuration_id()
             st.session_state.configuration_saved = False
             st.rerun()
@@ -3552,12 +3536,7 @@ with main_left:
                 format_func=lambda x: (
                     configuration_display_names.get(x, x)
                     if st.session_state.mdc_type == "Single Rack"
-                    else clean_text(
-                        available.loc[
-                            available["Configuration"] == x,
-                            "Configuration Title"
-                        ].iloc[0]
-                    ) or x
+                    else f"Solution {re.search(r'(\d+)$', x).group(1)}"
                 ),
                 key="configuration_selection",
             )
@@ -3565,6 +3544,7 @@ with main_left:
             if selected_configuration != old_configuration:
                 st.session_state.configuration = selected_configuration
                 st.session_state.multirack_selected = {}
+                st.session_state.multirack_qty = {}
             else:
                 st.session_state.configuration = selected_configuration
 
@@ -3650,11 +3630,44 @@ with main_left:
                                 unsafe_allow_html=True,
                             )
                         else:
-                            selected = st.checkbox(
-                                label,
-                                value=bool(st.session_state.multirack_selected.get(selection_key, False)),
-                                key=f"mr_component_{selection_key}",
+                            current_selected = bool(
+                                st.session_state.multirack_selected.get(selection_key, False)
                             )
+                            current_qty = int(
+                                numeric(
+                                    st.session_state.multirack_qty.get(
+                                        selection_key,
+                                        qty if pd.notna(qty) and qty > 0 else 1,
+                                    )
+                                )
+                            )
+                            current_qty = max(current_qty, 1)
+
+                            component_col1, component_col2 = st.columns(
+                                [4.5, 1.15], gap="small", vertical_alignment="center"
+                            )
+                            with component_col1:
+                                selected = st.checkbox(
+                                    label,
+                                    value=current_selected,
+                                    key=f"mr_component_{selection_key}",
+                                )
+
+                            with component_col2:
+                                if selected:
+                                    selected_qty = st.number_input(
+                                        "Qty",
+                                        min_value=1,
+                                        max_value=999,
+                                        step=1,
+                                        value=current_qty,
+                                        key=f"mr_qty_{selection_key}",
+                                        label_visibility="collapsed",
+                                    )
+                                    st.session_state.multirack_qty[selection_key] = selected_qty
+                                else:
+                                    st.session_state.multirack_qty.pop(selection_key, None)
+
                             st.session_state.multirack_selected[selection_key] = selected
     # ========================================================
     # 03. PDU SELECTION
@@ -3802,11 +3815,8 @@ with main_right:
         }
 
         def excel_optional_rows(keyword=None):
-            # Keep the expected columns even when there are no accessory rows.
-            # This prevents downstream filters such as fire_rows["Description"]
-            # from raising KeyError on an empty result.
             if accessories_df.empty:
-                return accessories_df.iloc[0:0].copy()
+                return pd.DataFrame()
             if not keyword:
                 return accessories_df.copy()
             key = str(keyword).upper()
