@@ -499,9 +499,13 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
 
             part = get(row, info["part"])
             desc = get(row, info["desc"])
-            qty = numeric(row.iloc[info["qty"]])
+            # Use the same safe column accessor for numeric fields as for
+            # text fields.  Some Excel rows/sheets can be shorter than the
+            # configured block width, and direct row.iloc[...] then raises
+            # IndexError.
+            qty = numeric(get(row, info["qty"]))
             uom = get(row, info["uom"])
-            price = numeric(row.iloc[info["price"]])
+            price = numeric(get(row, info["price"]))
 
             if not part and not desc:
                 continue
