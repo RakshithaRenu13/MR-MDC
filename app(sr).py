@@ -3798,8 +3798,11 @@ with main_right:
         }
 
         def excel_optional_rows(keyword=None):
+            # Keep the expected columns even when there are no accessory rows.
+            # This prevents downstream filters such as fire_rows["Description"]
+            # from raising KeyError on an empty result.
             if accessories_df.empty:
-                return pd.DataFrame()
+                return accessories_df.iloc[0:0].copy()
             if not keyword:
                 return accessories_df.copy()
             key = str(keyword).upper()
