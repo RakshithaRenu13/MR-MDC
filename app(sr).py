@@ -806,7 +806,7 @@ def load_multirack_boq():
 
             sno = cell(row, column_map.get("sno"))
             description = cell(row, column_map.get("description"))
-            quantity = numeric(row.iloc[column_map["qty"]])
+            quantity = numeric(cell(row, column_map.get("qty")))
             uom = cell(row, column_map.get("uom"))
             part_code = cell(row, column_map.get("part"))
             unit_cost = numeric(row.iloc[column_map["cost"]]) if "cost" in column_map else float("nan")
