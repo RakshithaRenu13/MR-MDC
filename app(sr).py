@@ -4398,8 +4398,13 @@ with main_right:
         }
 
         def excel_optional_rows(keyword=None):
+            # Always return the expected accessory columns, even when the
+            # master workbook contains no matching rows. This prevents
+            # downstream filters such as fire_rows["Description"] from
+            # raising KeyError on an empty, column-less DataFrame.
+            expected_cols = ["Part Code", "Description", "Default Quantity", "UOM", "Unit Cost"]
             if accessories_df.empty:
-                return pd.DataFrame()
+                return pd.DataFrame(columns=expected_cols)
             if not keyword:
                 return accessories_df.copy()
             key = str(keyword).upper()
