@@ -677,19 +677,7 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
 
 
 def load_multirack_boq():
-    """
-    Multirack-only loader.
-
-    Source of truth:
-        MULTIRACK BOQ.xlsx
-        sheet: Multi Rack config-1
-
-    The Single Rack loader above is intentionally NOT changed.
-    This parser reads Solution 1 ... Solution 9 and their component rows.
-    Shared rows repeated across all 9 solutions, or rows under an explicit
-    COMMON heading, are excluded from the solution rows and are loaded by
-    load_multirack_common_boq().
-    """
+    """Read MULTIRACK BOQ.xlsx directly at runtime; the workbook is the source of truth."""
     empty_configs = pd.DataFrame(columns=[
         "MDC Type", "Configuration", "Configuration Title", "Base Cost"
     ])
@@ -703,11 +691,18 @@ def load_multirack_boq():
         return empty_configs, empty_components
 
     try:
+        xl = pd.ExcelFile(MULTIRACK_FILE, engine="openpyxl")
+        if MULTIRACK_SHEET in xl.sheet_names:
+            sheet_name = MULTIRACK_SHEET
+        else:
+            candidates = [
+                s for s in xl.sheet_names
+                if "multirack" in re.sub(r"[^a-z0-9]", "", s.lower())
+                or "multi rack" in s.lower()
+            ]
+            sheet_name = candidates[0] if candidates else xl.sheet_names[0]
         raw = pd.read_excel(
-            MULTIRACK_FILE,
-            sheet_name=MULTIRACK_SHEET,
-            header=None,
-            engine="openpyxl",
+            MULTIRACK_FILE, sheet_name=sheet_name, header=None, engine="openpyxl"
         )
     except Exception:
         return empty_configs, empty_components
@@ -716,7 +711,7 @@ def load_multirack_boq():
         return empty_configs, empty_components
 
     def cell(row, col):
-        if col is None or col < 0 or col >= len(row):
+        if col is None or col >= len(row):
             return ""
         value = row.iloc[col]
         return "" if pd.isna(value) else str(value).strip()
@@ -731,37 +726,23 @@ def load_multirack_boq():
         return re.sub(r"[^A-Z0-9]+", "", clean_text(value).upper())
 
     solution_re = re.compile(
-        r"^\s*(?:SOLUTION|SOLN|CONFIGURATION|CONFIG)\s*[-_:.)#]*\s*(\d{1,2})(?:\s*[-:.)#].*)?\s*$",
+        r"^\s*(?:SOLUTION|SOLN|CONFIGURATION|CONFIG)\s*[-_:.)#]*\s*(\d{1,2})\s*$",
         re.IGNORECASE,
     )
     group_re = re.compile(
-        r"^\s*([A-Z])\s*(?:[-:.)]\s*(.*))?$",
+        r"^\s*([ABC])\s*(?:[-:.)]\s*(.*))?$",
         re.IGNORECASE,
     )
 
-    # Find the nine solution headings. A heading may contain a title after
-    # the number, e.g. "Solution 1 - 42U MDC".
     solution_starts = []
     for idx in range(len(raw)):
         vals = nonempty_values(raw.iloc[idx])
         if len(vals) == 1:
-            m = solution_re.match(vals[0])
-            if m:
-                number = int(m.group(1))
+            match = solution_re.match(vals[0])
+            if match:
+                number = int(match.group(1))
                 if 1 <= number <= 9:
                     solution_starts.append((idx, number, vals[0]))
-
-    # If the workbook uses a title row with extra cells, look for a cell
-    # containing Solution/Configuration N as a fallback.
-    if not solution_starts:
-        for idx in range(len(raw)):
-            for value in row_values(raw.iloc[idx]):
-                m = solution_re.match(value)
-                if m:
-                    number = int(m.group(1))
-                    if 1 <= number <= 9:
-                        solution_starts.append((idx, number, value))
-                        break
 
     unique = {}
     for idx, number, title in solution_starts:
@@ -771,8 +752,6 @@ def load_multirack_boq():
         key=lambda x: x[0],
     )
 
-    # No Multirack file / no solution headings: return empty data without
-    # affecting Single Rack behaviour.
     if not solution_starts:
         return empty_configs, empty_components
 
@@ -802,19 +781,10 @@ def load_multirack_boq():
     for pos, (start_row, number, solution_title_raw) in enumerate(solution_starts):
         end_row = solution_starts[pos + 1][0] if pos + 1 < len(solution_starts) else len(raw)
         config_name = f"Configuration {number}"
-        title_text = " ".join(clean_text(solution_title_raw).split())
-        solution_title = title_text or f"Solution {number}"
-
-        # Remove only the leading "Solution N" / "Configuration N" text.
-        solution_title = re.sub(
-            r"^\s*(?:SOLUTION|SOLN|CONFIGURATION|CONFIG)\s*[-_:.)#]*\s*\d{1,2}\s*[-:.)#]*\s*",
-            "",
-            solution_title,
-            flags=re.IGNORECASE,
-        ).strip(" -") or f"Solution {number}"
-
+        solution_title = " ".join(clean_text(solution_title_raw).split()) or f"Solution {number}"
         header_row, column_map = find_header(start_row, end_row)
         data_start = header_row + 1 if header_row is not None else start_row + 1
+
         current_group = "A"
         current_group_label = "A"
 
@@ -824,33 +794,22 @@ def load_multirack_boq():
             if not meaningful:
                 continue
 
-            upper_joined = " ".join(v.upper() for v in meaningful)
-            # Explicit common section. It is parsed into the common pool later.
-            if (
-                "COMMON COMPONENT" in upper_joined
-                or "COMMON ITEM" in upper_joined
-                or "SAME FOR ALL" in upper_joined
-                or upper_joined in {"COMMON", "COMMON COMPONENTS", "COMMON ITEMS"}
-            ):
-                current_group = "COMMON"
-                current_group_label = "Common Components"
-                continue
-
-            # Group headings such as A, B, C, B - Optional, etc.
-            if len(meaningful) == 1:
-                gm = group_re.match(meaningful[0])
-                if gm and gm.group(1).upper() in {"A", "B", "C"}:
-                    current_group = gm.group(1).upper()
-                    suffix = clean_text(gm.group(2))
-                    current_group_label = f"{current_group} - {suffix}" if suffix else current_group
-                    continue
-
+            # Read the normal S.No./Description/Qty/UOM row first.
+            #
+            # Multirack Excel supports BOTH layouts:
+            #   1) B/C are standalone group-heading rows.
+            #   2) B/C are written directly in the S.No. column for each
+            #      optional component row (the new workbook layout).
+            #
+            # In the new layout, four rows may have S.No. = B and one row
+            # may have S.No. = C. Those rows must become selectable
+            # checkboxes, while A/normal numeric rows remain mandatory.
             sno = cell(row, column_map.get("sno"))
             description = cell(row, column_map.get("description"))
-            qty_value = numeric(cell(row, column_map.get("qty")))
+            quantity = numeric(row.iloc[column_map["qty"]])
             uom = cell(row, column_map.get("uom"))
             part_code = cell(row, column_map.get("part"))
-            unit_cost = numeric(cell(row, column_map.get("cost"))) if "cost" in column_map else float("nan")
+            unit_cost = numeric(row.iloc[column_map["cost"]]) if "cost" in column_map else float("nan")
 
             if norm(sno) in {"SNO", "SERIALNO", "SERIALNUMBER", "SRNO"}:
                 continue
@@ -859,19 +818,46 @@ def load_multirack_boq():
             if not sno and not description and not part_code:
                 continue
 
+            # Standalone group-heading rows are still supported.
+            if len(meaningful) == 1:
+                group_match = group_re.match(meaningful[0])
+                if group_match:
+                    current_group = group_match.group(1).upper()
+                    suffix = clean_text(group_match.group(2))
+                    current_group_label = (
+                        f"{current_group} - {suffix}" if suffix else current_group
+                    )
+                    continue
+
+            # New Multirack workbook format:
+            # B/C are used instead of serial numbers on the component rows.
+            # A component row therefore carries its own group.
+            sno_group = norm(sno)
+            if sno_group in {"A", "B", "C"}:
+                row_group = sno_group
+                row_group_label = row_group
+                current_group = row_group
+                current_group_label = row_group_label
+            else:
+                row_group = current_group
+                row_group_label = current_group_label
+
+            qty_value = float(quantity) if pd.notna(quantity) else 0.0
+            selection_key = f"MR-{number}-{row_group}-{ridx}"
+
             component_rows.append({
                 "MDC Type": "Multirack",
                 "Configuration": config_name,
                 "Configuration Title": solution_title,
-                "Group": current_group,
-                "Group Label": current_group_label,
+                "Group": row_group,
+                "Group Label": row_group_label,
                 "S.No.": sno,
                 "Description": description,
-                "Quantity": float(qty_value) if pd.notna(qty_value) else 0.0,
+                "Quantity": qty_value,
                 "UOM": uom or "EA",
                 "Part Code": part_code,
                 "Unit Cost": unit_cost,
-                "Selection Key": f"MR-{number}-{current_group}-{ridx}",
+                "Selection Key": selection_key,
             })
 
         config_rows.append({
@@ -881,7 +867,6 @@ def load_multirack_boq():
             "Base Cost": 0.0,
         })
 
-    # Guarantee Solution 1 ... Solution 9 exist in the dropdown.
     existing = {r["Configuration"] for r in config_rows}
     for number in range(1, 10):
         name = f"Configuration {number}"
@@ -901,234 +886,18 @@ def load_multirack_boq():
     if components.empty:
         components = empty_components.copy()
 
-    # Rows explicitly marked COMMON are not part of a solution selection.
-    components = components[components["Group"].astype(str).str.upper() != "COMMON"].copy()
-
-    # Shared component detection: if the same description appears in all
-    # nine solutions, it belongs to the common Multirack pool. The separate
-    # common loader uses the same source workbook to preserve the rows.
-    if not components.empty:
-        desc_counts = (
-            components.assign(_desc=components["Description"].map(lambda x: norm(x)))
-            .query("_desc != ''")
-            .groupby("_desc")["Configuration"]
-            .nunique()
-        )
-        common_descs = set(desc_counts[desc_counts >= 9].index)
-        if common_descs:
-            components = components[
-                ~components["Description"].map(lambda x: norm(x)).isin(common_descs)
-            ].copy()
-
     return configs, components
-
-
-def load_multirack_common_boq():
-    """Load only the shared/common Multirack rows from Multi Rack config-1."""
-    columns = [
-        "MDC Type", "Configuration", "Configuration Title", "Group",
-        "Group Label", "S.No.", "Description", "Quantity", "UOM",
-        "Part Code", "Unit Cost", "Common Selection Key"
-    ]
-    empty = pd.DataFrame(columns=columns)
-
-    if not os.path.exists(MULTIRACK_FILE):
-        return empty
-
-    try:
-        raw = pd.read_excel(
-            MULTIRACK_FILE,
-            sheet_name=MULTIRACK_SHEET,
-            header=None,
-            engine="openpyxl",
-        )
-    except Exception:
-        return empty
-
-    if raw.empty:
-        return empty
-
-    def cell(row, col):
-        if col is None or col < 0 or col >= len(row):
-            return ""
-        value = row.iloc[col]
-        return "" if pd.isna(value) else str(value).strip()
-
-    def values(row):
-        return [cell(row, c) for c in range(len(raw.columns))]
-
-    def nonempty(row):
-        return [v for v in values(row) if v]
-
-    def norm(value):
-        return re.sub(r"[^A-Z0-9]+", "", clean_text(value).upper())
-
-    solution_re = re.compile(
-        r"^\s*(?:SOLUTION|SOLN|CONFIGURATION|CONFIG)\s*[-_:.)#]*\s*(\d{1,2})(?:\s*[-:.)#].*)?\s*$",
-        re.IGNORECASE,
-    )
-
-    starts = []
-    for idx in range(len(raw)):
-        vals = nonempty(raw.iloc[idx])
-        for v in vals:
-            m = solution_re.match(v)
-            if m and 1 <= int(m.group(1)) <= 9:
-                starts.append((idx, int(m.group(1))))
-                break
-
-    unique = {}
-    for idx, number in starts:
-        unique.setdefault(number, idx)
-    starts = sorted(unique.items(), key=lambda x: x[1])
-
-    def header_map(start, end):
-        aliases = {
-            "sno": {"SNO", "SERIALNO", "SERIALNUMBER", "SRNO"},
-            "description": {"DESCRIPTION", "DESC", "ITEMDESCRIPTION"},
-            "qty": {"QTY", "QUANTITY", "COUNT"},
-            "uom": {"UOM", "UNITOFMEASURE", "UNIT"},
-            "part": {"PARTCODE", "PARTNUMBER", "PARTNO", "PART"},
-            "cost": {"COST", "UNITCOST", "UNITPRICE", "PRICE", "SELLINGPRICE"},
-        }
-        for ridx in range(start, end):
-            mapped = {}
-            for col, v in enumerate(values(raw.iloc[ridx])):
-                n = norm(v)
-                for key, candidates in aliases.items():
-                    if n in candidates and key not in mapped:
-                        mapped[key] = col
-            if all(k in mapped for k in ("sno", "description", "qty", "uom")):
-                return ridx, mapped
-        return None, {"sno": 0, "description": 1, "qty": 2, "uom": 3}
-
-    rows = []
-
-    # 1) Explicit common rows anywhere in the workbook.
-    for pos, (number, start) in enumerate(starts):
-        end = starts[pos + 1][1] if pos + 1 < len(starts) else len(raw)
-        header_row, cmap = header_map(start, end)
-        data_start = header_row + 1 if header_row is not None else start + 1
-        in_common = False
-        for ridx in range(data_start, end):
-            row = raw.iloc[ridx]
-            vals = nonempty(row)
-            if not vals:
-                continue
-            joined = " ".join(v.upper() for v in vals)
-            if (
-                "COMMON COMPONENT" in joined
-                or "COMMON ITEM" in joined
-                or "SAME FOR ALL" in joined
-                or joined in {"COMMON", "COMMON COMPONENTS", "COMMON ITEMS"}
-            ):
-                in_common = True
-                continue
-            if not in_common:
-                continue
-            sno = cell(row, cmap.get("sno"))
-            desc = cell(row, cmap.get("description"))
-            qty = numeric(cell(row, cmap.get("qty")))
-            uom = cell(row, cmap.get("uom")) or "EA"
-            part = cell(row, cmap.get("part"))
-            cost = numeric(cell(row, cmap.get("cost"))) if "cost" in cmap else float("nan")
-            if not sno and not desc and not part:
-                continue
-            if norm(desc) in {"DESCRIPTION", "DESC", "ITEMDESCRIPTION"}:
-                continue
-            rows.append({
-                "MDC Type": "Multirack",
-                "Configuration": "Common",
-                "Configuration Title": "Common Components",
-                "Group": "COMMON",
-                "Group Label": "Common Components",
-                "S.No.": sno,
-                "Description": desc,
-                "Quantity": float(qty) if pd.notna(qty) else 0.0,
-                "UOM": uom,
-                "Part Code": part,
-                "Unit Cost": cost,
-            })
-
-    # 2) Shared rows repeated in all nine solutions. This is important for
-    # workbooks where the common items are physically repeated after every
-    # solution instead of having a COMMON heading.
-    all_rows = []
-    for pos, (number, start) in enumerate(starts):
-        end = starts[pos + 1][1] if pos + 1 < len(starts) else len(raw)
-        header_row, cmap = header_map(start, end)
-        data_start = header_row + 1 if header_row is not None else start + 1
-        for ridx in range(data_start, end):
-            row = raw.iloc[ridx]
-            vals = nonempty(row)
-            if not vals:
-                continue
-            desc = cell(row, cmap.get("description"))
-            qty = numeric(cell(row, cmap.get("qty")))
-            uom = cell(row, cmap.get("uom")) or "EA"
-            part = cell(row, cmap.get("part"))
-            if not desc or norm(desc) in {"DESCRIPTION", "DESC", "ITEMDESCRIPTION"}:
-                continue
-            all_rows.append({
-                "number": number,
-                "ridx": ridx,
-                "S.No.": cell(row, cmap.get("sno")),
-                "Description": desc,
-                "Quantity": float(qty) if pd.notna(qty) else 0.0,
-                "UOM": uom,
-                "Part Code": part,
-                "Unit Cost": numeric(cell(row, cmap.get("cost"))) if "cost" in cmap else float("nan"),
-            })
-
-    by_desc = {}
-    for r in all_rows:
-        key = norm(r["Description"])
-        if key:
-            by_desc.setdefault(key, []).append(r)
-
-    for key, matches in by_desc.items():
-        solution_numbers = {r["number"] for r in matches}
-        if len(solution_numbers) == 9:
-            # Add one canonical common row only.
-            r = matches[0]
-            rows.append({
-                "MDC Type": "Multirack",
-                "Configuration": "Common",
-                "Configuration Title": "Common Components",
-                "Group": "COMMON",
-                "Group Label": "Common Components",
-                "S.No.": r["S.No."],
-                "Description": r["Description"],
-                "Quantity": r["Quantity"],
-                "UOM": r["UOM"],
-                "Part Code": r["Part Code"],
-                "Unit Cost": r["Unit Cost"],
-            })
-
-    if not rows:
-        return empty
-
-    result = pd.DataFrame(rows, columns=columns[:-1])
-    result["_key"] = result.apply(
-        lambda r: f"COMMON-{norm(r['Description'])}-{norm(r['UOM'])}", axis=1
-    )
-    result = result.drop_duplicates("_key").drop(columns="_key")
-    result["Common Selection Key"] = [f"MR-COMMON-{i}" for i in range(len(result))]
-    return result[columns]
 
 
 try:
     configs_df, components_df, accessories_df, pdus_df, multirack_components_df = load_master(
-        master_mtime=file_mtime(MASTER_FILE),
-        multirack_mtime=file_mtime(MULTIRACK_FILE),
-    )
+    master_mtime=file_mtime(MASTER_FILE),
+    multirack_mtime=file_mtime(MULTIRACK_FILE),
+)
 except Exception as exc:
     st.error("Unable to load MDC_Master_V1.xlsx.")
     st.exception(exc)
     st.stop()
-
-# Multirack-only shared component pool. Single Rack data loading above is unchanged.
-multirack_common_components_df = load_multirack_common_boq()
 
 
 # ============================================================
@@ -1156,7 +925,6 @@ defaults = {
     "user_count": 0,
     "session_counted": False,
     "multirack_selected": {},
-    "multirack_common_selected": {},
 }
 
 for key, value in defaults.items():
@@ -1432,7 +1200,7 @@ def selected_components():
 
 
 def selected_multirack_components():
-    """Return selected Multirack solution rows plus selected common rows."""
+    """A is always included; B/C are included only when selected."""
     if st.session_state.mdc_type != "Multirack":
         return pd.DataFrame(columns=multirack_components_df.columns)
 
@@ -1440,33 +1208,15 @@ def selected_multirack_components():
         (multirack_components_df["MDC Type"] == "Multirack")
         & (multirack_components_df["Configuration"] == st.session_state.configuration)
     ].copy()
-
-    if rows.empty and multirack_common_components_df.empty:
+    if rows.empty:
         return rows
 
     selected_keys = {
-        str(key)
-        for key, selected in st.session_state.multirack_selected.items()
-        if selected
+        str(key) for key, selected in st.session_state.multirack_selected.items() if selected
     }
-
     is_a = rows["Group"].astype(str).str.upper().eq("A")
     is_selected_optional = rows["Selection Key"].astype(str).isin(selected_keys)
-    selected = rows[is_a | is_selected_optional].copy()
-
-    common_keys = {
-        str(key)
-        for key, selected_flag in st.session_state.multirack_common_selected.items()
-        if selected_flag
-    }
-    if common_keys and not multirack_common_components_df.empty:
-        common_rows = multirack_common_components_df[
-            multirack_common_components_df["Common Selection Key"].astype(str).isin(common_keys)
-        ].copy()
-        if not common_rows.empty:
-            selected = pd.concat([selected, common_rows], ignore_index=True)
-
-    return selected
+    return rows[is_a | is_selected_optional].copy()
 
 
 
@@ -1946,14 +1696,6 @@ def excel_bytes(
         if detailed_output
         else build_sales_boq(bom)
     )
-
-    # Multirack: retain every selected row (including PDU/accessories), but
-    # deliberately leave Part Code, Cost and Price fields blank in downloads.
-    if st.session_state.mdc_type == "Multirack" and detailed_output:
-        display_bom = display_bom.copy()
-        for _col in ["Part Code", "Unit Cost", "Total Cost", "Unit Price", "Total Price"]:
-            if _col in display_bom.columns:
-                display_bom[_col] = None
 
     # --------------------------------------------------------
     # GET FINAL PRICE SAFELY
@@ -2592,13 +2334,6 @@ def pdf_bytes(internal=False, bom=None, final_price=0.0):
     # table so Part Code and all pricing columns are present but blank.
     detailed_output = internal or st.session_state.mdc_type == "Multirack"
     display_bom = bom if detailed_output else build_sales_boq(bom)
-
-    # Multirack: retain every selected row, but blank Part Code/Cost/Price.
-    if st.session_state.mdc_type == "Multirack" and detailed_output:
-        display_bom = display_bom.copy()
-        for _col in ["Part Code", "Unit Cost", "Total Cost", "Unit Price", "Total Price"]:
-            if _col in display_bom.columns:
-                display_bom[_col] = None
 
     # --------------------------------------------------------
     # FINAL PRICE
@@ -3773,7 +3508,6 @@ with main_left:
             st.session_state.accessory_qty = {}
             st.session_state.pdu_qty = {}
             st.session_state.multirack_selected = {}
-            st.session_state.multirack_common_selected = {}
             st.session_state.configuration_id = generate_configuration_id()
             st.session_state.configuration_saved = False
             st.rerun()
@@ -3794,94 +3528,36 @@ with main_left:
         if labels:
             old_configuration = st.session_state.configuration
 
-            # SINGLE RACK: keep the existing selector exactly as-is.
-            if st.session_state.mdc_type == "Single Rack":
-                selected_configuration = st.selectbox(
-                    "Select Configuration",
-                    labels,
-                    index=(
-                        labels.index(old_configuration)
-                        if old_configuration in labels else 0
-                    ),
-                    format_func=lambda x: (
-                        configuration_display_names.get(x, x)
-                        if st.session_state.mdc_type == "Single Rack"
-                        else clean_text(
-                            available.loc[
-                                available["Configuration"] == x,
-                                "Configuration Title"
-                            ].iloc[0]
-                        ) or x
-                    ),
-                    key="configuration_selection",
-                )
+            selected_configuration = st.selectbox(
+                "Select Configuration",
+                labels,
+                index=(
+                    labels.index(old_configuration)
+                    if old_configuration in labels else 0
+                ),
+                format_func=lambda x: (
+                    configuration_display_names.get(x, x)
+                    if st.session_state.mdc_type == "Single Rack"
+                    else clean_text(
+                        available.loc[
+                            available["Configuration"] == x,
+                            "Configuration Title"
+                        ].iloc[0]
+                    ) or x
+                ),
+                key="configuration_selection",
+            )
 
-                if selected_configuration != old_configuration:
-                    st.session_state.configuration = selected_configuration
-                else:
-                    st.session_state.configuration = selected_configuration
-
-            # MULTIRACK ONLY: Solution 1-9 + Common Components side-by-side.
+            if selected_configuration != old_configuration:
+                st.session_state.configuration = selected_configuration
+                st.session_state.multirack_selected = {}
             else:
-                left_cfg, right_common = st.columns([1.0, 1.0], gap="small")
-
-                with left_cfg:
-                    selected_configuration = st.selectbox(
-                        "Select Solution / Configuration",
-                        labels,
-                        index=(
-                            labels.index(old_configuration)
-                            if old_configuration in labels else 0
-                        ),
-                        format_func=lambda x: (
-                            f"Solution {re.search(r'(\\d+)', str(x)).group(1)}"
-                            if re.search(r"(\\d+)", str(x))
-                            else str(x)
-                        ),
-                        key="multirack_configuration_selection",
-                    )
-
-                if selected_configuration != old_configuration:
-                    st.session_state.configuration = selected_configuration
-                    st.session_state.multirack_selected = {}
-                    st.session_state.multirack_common_selected = {}
-                else:
-                    st.session_state.configuration = selected_configuration
-
-                with right_common:
-                    common_options = []
-                    common_lookup = {}
-                    if not multirack_common_components_df.empty:
-                        for _, common_row in multirack_common_components_df.iterrows():
-                            key = clean_text(common_row.get("Common Selection Key"))
-                            desc = clean_text(common_row.get("Description"))
-                            qty = numeric(common_row.get("Quantity"))
-                            uom = clean_text(common_row.get("UOM")) or "EA"
-                            if not key or not desc:
-                                continue
-                            qty_text = f" ({qty:g} {uom})" if pd.notna(qty) else ""
-                            label = f"{desc}{qty_text}"
-                            common_options.append(key)
-                            common_lookup[key] = label
-
-                    selected_common = st.multiselect(
-                        "Common Multirack Components",
-                        common_options,
-                        default=[
-                            k for k in common_options
-                            if st.session_state.multirack_common_selected.get(k, False)
-                        ],
-                        format_func=lambda k: common_lookup.get(k, k),
-                        key=f"multirack_common_selection_{selected_configuration}",
-                    )
-                    st.session_state.multirack_common_selected = {
-                        k: (k in selected_common) for k in common_options
-                    }
+                st.session_state.configuration = selected_configuration
 
     # ========================================================
     # 02. MULTIRACK SOLUTION COMPONENTS
-    # Multirack data is already selected through the Solution selector
-    # and Common Components selector above. Single Rack is untouched.
+    # Read directly from MULTIRACK BOQ.xlsx.
+    # A = main configuration; B/C = optional selections.
     # ========================================================
     if st.session_state.mdc_type == "Multirack":
         with st.container(border=True):
@@ -3892,49 +3568,76 @@ with main_left:
                 '</div>',
                 unsafe_allow_html=True,
             )
-            mr_rows = multirack_components_df[
+
+            all_mr_rows = multirack_components_df[
                 (multirack_components_df["MDC Type"] == "Multirack")
                 & (multirack_components_df["Configuration"] == st.session_state.configuration)
             ].copy()
-            if mr_rows.empty and not os.path.exists(MULTIRACK_FILE):
-                st.warning("MULTIRACK BOQ.xlsx was not found in the app folder.")
-            elif mr_rows.empty:
-                st.info(
-                    f"No solution components were found for {st.session_state.configuration} "
-                    "in sheet 'Multi Rack config-1'."
-                )
+
+            if all_mr_rows.empty:
+                if not os.path.exists(MULTIRACK_FILE):
+                    st.warning("MULTIRACK BOQ.xlsx was not found in the app folder.")
+                else:
+                    st.info(
+                        f"No components were found for {st.session_state.configuration} "
+                        f"in the Multirack Excel workbook."
+                    )
             else:
-                st.caption(
-                    "Solution components are loaded from MULTIRACK BOQ.xlsx; "
-                    "Group A is included automatically and B/C selections remain available below."
-                )
-                for group in ["A", "B", "C"]:
-                    group_rows = mr_rows[mr_rows["Group"].astype(str).str.upper() == group]
+                encountered_groups = []
+                for group in all_mr_rows["Group"].astype(str):
+                    if group not in encountered_groups:
+                        encountered_groups.append(group)
+
+                group_order = []
+                for preferred in ["A", "B", "C"]:
+                    if preferred in encountered_groups:
+                        group_order.append(preferred)
+                for group in encountered_groups:
+                    if group not in group_order:
+                        group_order.append(group)
+
+                for group in group_order:
+                    group_rows = all_mr_rows[
+                        all_mr_rows["Group"].astype(str) == str(group)
+                    ].copy()
                     if group_rows.empty:
                         continue
-                    label = clean_text(group_rows.iloc[0].get("Group Label")) or group
+
+                    labels = (
+                        group_rows["Group Label"].dropna().astype(str).str.strip().tolist()
+                        if "Group Label" in group_rows.columns else []
+                    )
+                    group_label = next((x for x in labels if x), group)
+
                     st.markdown(
-                        f'<div class="mdc-mini-heading" style="text-align:center;">{clean_text(label)}</div>',
+                        f'<div class="mdc-mini-heading" style="text-align:center;">'
+                        f'{clean_text(group_label)}</div>',
                         unsafe_allow_html=True,
                     )
+
                     for _, mr in group_rows.iterrows():
                         selection_key = clean_text(mr.get("Selection Key"))
                         description = clean_text(mr.get("Description"))
+                        qty = numeric(mr.get("Quantity"))
+                        qty_text = f"{qty:g}" if pd.notna(qty) else ""
+                        uom = clean_text(mr.get("UOM")) or "EA"
                         if not description:
                             continue
-                        qty = numeric(mr.get("Quantity"))
-                        uom = clean_text(mr.get("UOM")) or "EA"
-                        qty_text = f" ({qty:g} {uom})" if pd.notna(qty) else ""
-                        label_text = f"{description}{qty_text}"
-                        if group == "A":
+
+                        label = description
+                        if qty_text:
+                            label = f"{description} ({qty_text} {uom})"
+
+                        if str(group).upper() == "A":
                             st.markdown(
-                                f'<div style="padding:3px 6px;color:#334155;">'
-                                f'<span style="font-weight:700;">✓</span>&nbsp;{label_text}</div>',
+                                f'<div style="padding:4px 6px;color:#334155;">'
+                                f'<span style="font-weight:700;">✓</span>&nbsp;{label}'
+                                f'</div>',
                                 unsafe_allow_html=True,
                             )
                         else:
                             selected = st.checkbox(
-                                label_text,
+                                label,
                                 value=bool(st.session_state.multirack_selected.get(selection_key, False)),
                                 key=f"mr_component_{selection_key}",
                             )
