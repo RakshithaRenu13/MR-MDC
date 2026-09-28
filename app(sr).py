@@ -482,9 +482,19 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
         block = sheet.iloc[info["start"]:info["end"]]
 
         title_col = info["part"]
-        solution_title = get(block.iloc[0], title_col)
-        if not solution_title:
+
+        # A workbook can contain fewer rows than the fixed legacy
+        # Single-Rack block boundaries (0:25 / 25:50).  In that case
+        # pandas returns an empty block and block.iloc[0] raises
+        # "single positional indexer is out-of-bounds".
+        # Keep the configuration entry, but safely fall back to its
+        # configuration name and let the component loop remain empty.
+        if block.empty:
             solution_title = config_name
+        else:
+            solution_title = get(block.iloc[0], title_col)
+            if not solution_title:
+                solution_title = config_name
 
         solution_title = " ".join(solution_title.split())
         solution_title = solution_title.replace("SOLUTION 1", "")
