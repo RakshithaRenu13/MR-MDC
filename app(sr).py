@@ -499,9 +499,9 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
 
             part = get(row, info["part"])
             desc = get(row, info["desc"])
-            qty = numeric(row.iloc[info["qty"]])
+            qty = numeric(get(row, info["qty"]))
             uom = get(row, info["uom"])
-            price = numeric(row.iloc[info["price"]])
+            price = numeric(get(row, info["price"]))
 
             if not part and not desc:
                 continue
