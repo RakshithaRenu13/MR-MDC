@@ -439,10 +439,28 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
         engine="openpyxl",
     )
 
+    # Some deployed copies of the master workbook can be empty or have
+    # fewer rows/columns than the historical template. Keep the loader
+    # alive in that case instead of crashing on positional indexing.
+    if sheet is None:
+        sheet = pd.DataFrame()
+
     def get(row, col):
-        if col >= len(row):
+        if row is None or col is None or col < 0 or col >= len(row):
             return ""
         return clean_text(row.iloc[col])
+
+    def get_pos(row, col):
+        """Safely read a positional Excel cell; missing columns are blank."""
+        if row is None or col is None:
+            return ""
+        try:
+            col = int(col)
+        except (TypeError, ValueError):
+            return ""
+        if col < 0 or col >= len(row):
+            return ""
+        return row.iloc[col]
 
     def is_part_header(value):
         return get(pd.Series([value]), 0).upper() in {
@@ -482,7 +500,12 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
         block = sheet.iloc[info["start"]:info["end"]]
 
         title_col = info["part"]
-        solution_title = get(block.iloc[0], title_col)
+        if block.empty:
+            # The master workbook may contain fewer rows than the historical
+            # fixed ranges. Do not index block.iloc[0] when the block is empty.
+            solution_title = config_name
+        else:
+            solution_title = get(block.iloc[0], title_col)
         if not solution_title:
             solution_title = config_name
 
@@ -602,9 +625,9 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
         for _, row in sheet.iloc[optional_start:optional_end].iterrows():
             part = get(row, 0)
             desc = get(row, 1)
-            qty = numeric(row.iloc[2])
+            qty = numeric(get_pos(row, 2))
             uom = get(row, 3)
-            price = numeric(row.iloc[4])
+            price = numeric(get_pos(row, 4))
 
             if not part or not desc:
                 continue
@@ -649,10 +672,10 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
             if part.upper() in {"PART NUMBER", "PART NO", "PART CODE"}:
                 continue
 
-            c13 = numeric(row.iloc[2])
-            c19 = numeric(row.iloc[3])
+            c13 = numeric(get_pos(row, 2))
+            c19 = numeric(get_pos(row, 3))
             excel_type = get(row, 4)
-            price = numeric(row.iloc[5])
+            price = numeric(get_pos(row, 5))
 
             if excel_type:
                 current_pdu_type = excel_type.upper()
