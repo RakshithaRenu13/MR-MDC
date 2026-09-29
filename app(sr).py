@@ -19,12 +19,11 @@ import streamlit as st
 
 # ============================================================
 # EATON MDC SOLUTION CONFIGURATOR
-# Data sources:
-#   Single Rack  -> MDC_Master_V1.xlsx
-#   Multirack    -> MULTIRACK BOQ.xlsx
-#                  sheet: Multi Rack config-1
+# Data source: MDC_Master_V1.xlsx
 # IMPORTANT:
-#   Both workbooks are expected in the same folder as this app.py.
+#   The Excel workbook must be in the same folder as this app.py.
+#   The workbook contains ONE sheet:
+#       1R MDC (4 Configs) BOM
 # ============================================================
 
 st.set_page_config(
@@ -77,7 +76,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MASTER_FILE = os.path.join(BASE_DIR, "MDC_Master_V1 (2).xlsx")
+MASTER_FILE = os.path.join(BASE_DIR, "MDC_Master_V1.xlsx")
 MULTIRACK_FILE = os.path.join(BASE_DIR, "MULTIRACK BOQ.xlsx")
 MULTIRACK_SHEET = "Multi Rack config-1"
 TRACKING_DB = os.path.join(BASE_DIR, "MDC_Tracking.db")
@@ -400,32 +399,18 @@ init_tracking_db()
 # EVERYTHING USED BY THE UI IS READ FROM MDC_Master_V1.xlsx
 # ============================================================
 
-def file_mtime(path):
-    """Return the file modification time so Streamlit reloads changed Excel files."""
-    try:
-        return os.path.getmtime(path)
-    except OSError:
-        return 0.0
-
-
 @st.cache_data
-
 def load_master(master_mtime=0.0, multirack_mtime=0.0):
     """
-    Load the existing Single Rack master exactly as before and, separately,
-    load the Multirack workbook when it is available.
+    Load the existing Single Rack master exactly as before and separately
+    load Multirack BOQ.xlsx / Multi Rack config-1.
 
-    Multirack source:
-        MULTIRACK BOQ.xlsx
-        sheet: Multi Rack config-1
-
-    The Multirack workbook is intentionally treated as a non-priced BOQ:
-        S.No. | Description | Qty | UOM
-
-    The parser is tolerant of the workbook's layout. It detects:
-      - Configuration 1 ... Configuration 9
-      - B / C group headings
-      - S.No / Description / Qty / UOM header rows
+    Multirack workbook layout supported:
+      - 9 solutions/configurations
+      - each solution contains categories A, B and C
+      - columns: S.No., Description, Qty, UOM
+      - A is mandatory for the selected solution
+      - B and C are common/optional and are exposed as checkboxes
     """
     if not os.path.exists(MASTER_FILE):
         raise FileNotFoundError(
@@ -440,17 +425,12 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
     )
 
     def get(row, col):
-        if col >= len(row):
+        if row is None or col is None or col < 0 or col >= len(row):
             return ""
         return clean_text(row.iloc[col])
 
-    def is_part_header(value):
-        return get(pd.Series([value]), 0).upper() in {
-            "PART NUMBER", "PART NO", "PART CODE"
-        }
-
     # --------------------------------------------------------
-    # SINGLE-RACK CONFIGURATIONS
+    # SINGLE-RACK CONFIGURATIONS — unchanged
     # --------------------------------------------------------
     block_info = {
         "Configuration 1": {
@@ -481,16 +461,13 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
     for config_name, info in block_info.items():
         block = sheet.iloc[info["start"]:info["end"]]
 
-        title_col = info["part"]
-        solution_title = get(block.iloc[0], title_col)
+        solution_title = get(block.iloc[0], info["part"]) if not block.empty else ""
         if not solution_title:
             solution_title = config_name
 
         solution_title = " ".join(solution_title.split())
-        solution_title = solution_title.replace("SOLUTION 1", "")
-        solution_title = solution_title.replace("SOLUTION 2", "")
-        solution_title = solution_title.replace("SOLUTION 3", "")
-        solution_title = solution_title.replace("SOLUTION 4", "")
+        for token in ("SOLUTION 1", "SOLUTION 2", "SOLUTION 3", "SOLUTION 4"):
+            solution_title = solution_title.replace(token, "")
         solution_title = " ".join(solution_title.split()).strip(" -")
 
         for local_index, (_, row) in enumerate(block.iterrows()):
@@ -505,10 +482,8 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
 
             if not part and not desc:
                 continue
-
             if part.upper() in {"PART NUMBER", "PART NO", "PART CODE"}:
                 continue
-
             if part.upper() == "CTO3M002":
                 continue
 
@@ -528,18 +503,18 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
             if r["Configuration"] == config_name
         ])
 
-        if cfg_components.empty:
-            base_cost = 0.0
-        else:
-            base_cost = float(
-                pd.to_numeric(
-                    cfg_components["Unit Cost"], errors="coerce"
-                ).fillna(0).mul(
-                    pd.to_numeric(
-                        cfg_components["Quantity"], errors="coerce"
-                    ).fillna(0)
-                ).sum()
+        base_cost = (
+            float(
+                pd.to_numeric(cfg_components["Unit Cost"], errors="coerce")
+                .fillna(0)
+                .mul(
+                    pd.to_numeric(cfg_components["Quantity"], errors="coerce")
+                    .fillna(0)
+                )
+                .sum()
             )
+            if not cfg_components.empty else 0.0
+        )
 
         config_rows.append({
             "MDC Type": "Single Rack",
@@ -552,42 +527,294 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
     components = pd.DataFrame(component_rows)
 
     # --------------------------------------------------------
-    # MULTIRACK BOQ
+    # MULTIRACK — read from the new workbook
     # --------------------------------------------------------
-    multirack_configs, multirack_components = load_multirack_boq()
+    mr_columns = [
+        "MDC Type", "Configuration", "Configuration Title",
+        "Group", "Group Label", "S.No.", "Description",
+        "Quantity", "UOM", "Part Code", "Unit Cost",
+        "Selection Key",
+    ]
+    multirack_components = pd.DataFrame(columns=mr_columns)
 
-    if multirack_configs.empty:
-        # Keep the existing app usable even before the new GitHub Excel
-        # file is uploaded. The nine configuration selectors are still
-        # created and the UI will show a clear data-source message.
-        multirack_configs = pd.DataFrame([
-            {
-                "MDC Type": "Multirack",
-                "Configuration": f"Configuration {n}",
-                "Configuration Title": f"Multirack Configuration {n}",
-                "Base Cost": 0.0,
-            }
-            for n in range(1, 10)
-        ])
+    if os.path.exists(MULTIRACK_FILE):
+        raw = pd.read_excel(
+            MULTIRACK_FILE,
+            sheet_name=MULTIRACK_SHEET,
+            header=None,
+            engine="openpyxl",
+        )
+
+        if raw is not None and not raw.empty:
+            def row_values(r):
+                return [
+                    clean_text(r.iloc[c])
+                    for c in range(len(r))
+                    if c < len(r)
+                ]
+
+            def norm(value):
+                return re.sub(r"[^A-Z0-9]+", "", clean_text(value).upper())
+
+            def nonempty_values(r):
+                return [x for x in row_values(r) if x]
+
+            solution_re = re.compile(
+                r"^\s*(?:SOLUTION|SOLN|CONFIGURATION|CONFIG|OPTION)"
+                r"\s*[-_:.)#]*\s*(\d{1,2})"
+                r"(?:\s*[-:.)#].*)?\s*$",
+                re.IGNORECASE,
+            )
+
+            # Find solution heading rows.
+            starts = []
+            for idx in range(len(raw)):
+                vals = nonempty_values(raw.iloc[idx])
+                found = None
+                for value in vals:
+                    match = solution_re.match(value)
+                    if match:
+                        number = int(match.group(1))
+                        if 1 <= number <= 9:
+                            found = number
+                            break
+                if found is not None:
+                    starts.append((idx, found))
+
+            # If headings are repeated/merged, retain the first occurrence.
+            first_start = {}
+            for idx, number in starts:
+                first_start.setdefault(number, idx)
+            starts = sorted(first_start.items(), key=lambda x: x[1])
+
+            # Fallback for workbooks whose first cell is simply "1", "2", ... .
+            if not starts:
+                for idx in range(len(raw)):
+                    vals = nonempty_values(raw.iloc[idx])
+                    if not vals:
+                        continue
+                    first = norm(vals[0])
+                    if first in {str(n) for n in range(1, 10)} and len(vals) <= 2:
+                        number = int(first)
+                        if number not in first_start:
+                            first_start[number] = idx
+                starts = sorted(first_start.items(), key=lambda x: x[1])
+
+            def detect_header(start, end):
+                aliases = {
+                    "sno": {
+                        "SNO", "SRNO", "SERIALNO", "SERIALNUMBER",
+                        "SLNO", "SLNUMBER"
+                    },
+                    "description": {
+                        "DESCRIPTION", "DESC", "ITEMDESCRIPTION"
+                    },
+                    "qty": {
+                        "QTY", "QUANTITY", "COUNT"
+                    },
+                    "uom": {
+                        "UOM", "UNIT", "UNITOFMEASURE", "UNITOFMEASUREMENT"
+                    },
+                    "part": {
+                        "PART", "PARTCODE", "PARTNO", "PARTNUMBER"
+                    },
+                    "cost": {
+                        "COST", "UNITCOST", "PRICE", "UNITPRICE"
+                    },
+                }
+
+                for ridx in range(start, end):
+                    mapped = {}
+                    for col, value in enumerate(row_values(raw.iloc[ridx])):
+                        n = norm(value)
+                        for key, candidates in aliases.items():
+                            if n in candidates and key not in mapped:
+                                mapped[key] = col
+
+                    if all(k in mapped for k in ("sno", "description", "qty", "uom")):
+                        return ridx, mapped
+
+                # User-specified standard layout.
+                return None, {
+                    "sno": 0,
+                    "description": 1,
+                    "qty": 2,
+                    "uom": 3,
+                }
+
+            def detect_group(r):
+                vals = nonempty_values(r)
+                joined = " ".join(vals).strip().upper()
+
+                # Exact category labels.
+                if any(norm(v) in {"A", "CATEGORYA", "GROUPA"} for v in vals):
+                    return "A"
+                if any(norm(v) in {"B", "CATEGORYB", "GROUPB"} for v in vals):
+                    return "B"
+                if any(norm(v) in {"C", "CATEGORYC", "GROUPC"} for v in vals):
+                    return "C"
+
+                # Textual category headings such as "Category A".
+                if re.search(r"\bCATEGORY\s*A\b", joined, re.I):
+                    return "A"
+                if re.search(r"\bCATEGORY\s*B\b", joined, re.I):
+                    return "B"
+                if re.search(r"\bCATEGORY\s*C\b", joined, re.I):
+                    return "C"
+                if re.search(r"\bGROUP\s*A\b", joined, re.I):
+                    return "A"
+                if re.search(r"\bGROUP\s*B\b", joined, re.I):
+                    return "B"
+                if re.search(r"\bGROUP\s*C\b", joined, re.I):
+                    return "C"
+
+                return None
+
+            parsed = []
+
+            for pos, (solution_number, start_row) in enumerate(starts):
+                end_row = (
+                    starts[pos + 1][1]
+                    if pos + 1 < len(starts)
+                    else len(raw)
+                )
+
+                header_row, cmap = detect_header(start_row, end_row)
+
+                # The solution title is the first non-empty text row after the
+                # solution marker, or the marker itself if it contains a title.
+                title = f"Multirack Configuration {solution_number}"
+                for ridx in range(start_row, min(end_row, start_row + 4)):
+                    vals = nonempty_values(raw.iloc[ridx])
+                    for value in vals:
+                        if solution_re.match(value):
+                            title = value
+                            break
+                    if title != f"Multirack Configuration {solution_number}":
+                        break
+
+                current_group = None
+                data_start = (
+                    header_row + 1
+                    if header_row is not None
+                    else start_row + 1
+                )
+
+                for ridx in range(data_start, end_row):
+                    row = raw.iloc[ridx]
+                    vals = nonempty_values(row)
+
+                    if not vals:
+                        continue
+
+                    # Category headings change the group for following rows.
+                    detected_group = detect_group(row)
+                    if detected_group:
+                        current_group = detected_group
+                        continue
+
+                    # Ignore repeated column headings.
+                    normalized = {norm(v) for v in vals}
+                    if {"SNO", "DESCRIPTION", "QTY", "UOM"}.issubset(normalized):
+                        continue
+
+                    def cell_at(key):
+                        col = cmap.get(key)
+                        if col is None or col >= len(row):
+                            return ""
+                        return clean_text(row.iloc[col])
+
+                    sno = cell_at("sno")
+                    desc = cell_at("description")
+                    qty_raw = cell_at("qty")
+                    uom = cell_at("uom")
+                    part = cell_at("part")
+                    cost_raw = cell_at("cost")
+
+                    # Only actual BOQ lines are collected.
+                    if not desc:
+                        continue
+
+                    # If no category marker was found, don't silently assign a
+                    # row to A/B/C; it will be ignored rather than misclassified.
+                    if current_group not in {"A", "B", "C"}:
+                        continue
+
+                    qty = numeric(qty_raw)
+                    cost = numeric(cost_raw)
+
+                    parsed.append({
+                        "MDC Type": "Multirack",
+                        "Configuration": f"Configuration {solution_number}",
+                        "Configuration Title": clean_text(title),
+                        "Group": current_group,
+                        "Group Label": f"Category {current_group}",
+                        "S.No.": sno,
+                        "Description": desc,
+                        "Quantity": (
+                            float(qty) if pd.notna(qty) else 0.0
+                        ),
+                        "UOM": uom or "EA",
+                        "Part Code": part,
+                        "Unit Cost": cost,
+                    })
+
+            if parsed:
+                mr = pd.DataFrame(parsed)
+
+                # Stable selection keys. A is mandatory; B/C are optional.
+                mr["Selection Key"] = mr.apply(
+                    lambda r: (
+                        f"MR-{r['Configuration']}-"
+                        f"{r['Group']}-"
+                        f"{r['S.No.']}-"
+                        f"{norm(r['Description'])}"
+                    ),
+                    axis=1,
+                )
+
+                multirack_components = mr[mr["Configuration"].isin(
+                    [f"Configuration {n}" for n in range(1, 10)]
+                )].copy()
+
+    # Create the nine Multirack configuration records from the parsed data.
+    mr_config_rows = []
+    for n in range(1, 10):
+        cfg = f"Configuration {n}"
+        cfg_rows = multirack_components[
+            multirack_components["Configuration"] == cfg
+        ]
+
+        title = (
+            clean_text(cfg_rows["Configuration Title"].iloc[0])
+            if not cfg_rows.empty else f"Multirack Configuration {n}"
+        )
+
+        mr_config_rows.append({
+            "MDC Type": "Multirack",
+            "Configuration": cfg,
+            "Configuration Title": title,
+            "Base Cost": 0.0,
+        })
 
     configs = pd.concat(
-        [configs, multirack_configs],
+        [configs, pd.DataFrame(mr_config_rows)],
         ignore_index=True,
     )
 
     # --------------------------------------------------------
-    # OTHER OPTIONAL ITEMS
+    # SINGLE-RACK OPTIONAL ITEMS
     # --------------------------------------------------------
     accessories = []
     optional_start = None
     optional_end = None
 
     for i in range(len(sheet)):
-        text = " ".join(get(sheet.iloc[i], 0).split()).upper()
-        if "OTHER OPTIONAL ITEMS" in text:
+        text_row = " ".join(get(sheet.iloc[i], 0).split()).upper()
+        if "OTHER OPTIONAL ITEMS" in text_row:
             optional_start = i + 1
             continue
-        if optional_start is not None and "SINGLE PHASE PDU" in text:
+        if optional_start is not None and "SINGLE PHASE PDU" in text_row:
             optional_end = i
             break
 
@@ -604,7 +831,6 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
 
             if not part or not desc:
                 continue
-
             if part.upper() in {"PART NUMBER", "PART NO", "PART CODE"}:
                 continue
 
@@ -621,14 +847,14 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
     accessories = pd.DataFrame(accessories)
 
     # --------------------------------------------------------
-    # SINGLE PHASE PDU'S
+    # SINGLE-RACK PDU'S
     # --------------------------------------------------------
     pdus = []
     pdu_start = None
 
     for i in range(len(sheet)):
-        text = " ".join(get(sheet.iloc[i], 0).split()).upper()
-        if "SINGLE PHASE PDU" in text:
+        text_row = " ".join(get(sheet.iloc[i], 0).split()).upper()
+        if "SINGLE PHASE PDU" in text_row:
             pdu_start = i + 1
             break
 
@@ -641,7 +867,6 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
 
             if not part and not desc:
                 continue
-
             if part.upper() in {"PART NUMBER", "PART NO", "PART CODE"}:
                 continue
 
@@ -673,205 +898,22 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
             if df[col].dtype == object:
                 df[col] = df[col].fillna("").astype(str).str.strip()
 
-    return configs, components, accessories, pdus, multirack_components
-
-
-def load_multirack_boq():
-    """Read MULTIRACK BOQ.xlsx directly at runtime; the workbook is the source of truth."""
-    empty_configs = pd.DataFrame(columns=[
-        "MDC Type", "Configuration", "Configuration Title", "Base Cost"
-    ])
-    empty_components = pd.DataFrame(columns=[
-        "MDC Type", "Configuration", "Configuration Title", "Group",
-        "Group Label", "S.No.", "Description", "Quantity", "UOM",
-        "Part Code", "Unit Cost", "Selection Key"
-    ])
-
-    if not os.path.exists(MULTIRACK_FILE):
-        return empty_configs, empty_components
-
-    try:
-        xl = pd.ExcelFile(MULTIRACK_FILE, engine="openpyxl")
-        if MULTIRACK_SHEET in xl.sheet_names:
-            sheet_name = MULTIRACK_SHEET
-        else:
-            candidates = [
-                s for s in xl.sheet_names
-                if "multirack" in re.sub(r"[^a-z0-9]", "", s.lower())
-                or "multi rack" in s.lower()
-            ]
-            sheet_name = candidates[0] if candidates else xl.sheet_names[0]
-        raw = pd.read_excel(
-            MULTIRACK_FILE, sheet_name=sheet_name, header=None, engine="openpyxl"
-        )
-    except Exception:
-        return empty_configs, empty_components
-
-    if raw.empty:
-        return empty_configs, empty_components
-
-    def cell(row, col):
-        if col is None or col >= len(row):
-            return ""
-        value = row.iloc[col]
-        return "" if pd.isna(value) else str(value).strip()
-
-    def row_values(row):
-        return [cell(row, c) for c in range(len(raw.columns))]
-
-    def nonempty_values(row):
-        return [v for v in row_values(row) if v]
-
-    def norm(value):
-        return re.sub(r"[^A-Z0-9]+", "", clean_text(value).upper())
-
-    solution_re = re.compile(
-        r"^\s*(?:SOLUTION|SOLN|CONFIGURATION|CONFIG)\s*[-_:.)#]*\s*(\d{1,2})\s*$",
-        re.IGNORECASE,
+    return (
+        configs,
+        components,
+        accessories,
+        pdus,
+        multirack_components,
     )
-    group_re = re.compile(
-        r"^\s*([ABC])\s*(?:[-:.)]\s*(.*))?$",
-        re.IGNORECASE,
-    )
-
-    solution_starts = []
-    for idx in range(len(raw)):
-        vals = nonempty_values(raw.iloc[idx])
-        if len(vals) == 1:
-            match = solution_re.match(vals[0])
-            if match:
-                number = int(match.group(1))
-                if 1 <= number <= 9:
-                    solution_starts.append((idx, number, vals[0]))
-
-    unique = {}
-    for idx, number, title in solution_starts:
-        unique.setdefault(number, (idx, title))
-    solution_starts = sorted(
-        [(idx, number, title) for number, (idx, title) in unique.items()],
-        key=lambda x: x[0],
-    )
-
-    if not solution_starts:
-        return empty_configs, empty_components
-
-    def find_header(start, end):
-        aliases = {
-            "sno": {"SNO", "SERIALNO", "SERIALNUMBER", "SRNO"},
-            "description": {"DESCRIPTION", "DESC", "ITEMDESCRIPTION"},
-            "qty": {"QTY", "QUANTITY", "COUNT"},
-            "uom": {"UOM", "UNITOFMEASURE", "UNIT"},
-            "part": {"PARTCODE", "PARTNUMBER", "PARTNO", "PART"},
-            "cost": {"COST", "UNITCOST", "UNITPRICE", "PRICE", "SELLINGPRICE"},
-        }
-        for ridx in range(start, end):
-            mapped = {}
-            for col, value in enumerate(row_values(raw.iloc[ridx])):
-                n = norm(value)
-                for key, candidates in aliases.items():
-                    if n in candidates and key not in mapped:
-                        mapped[key] = col
-            if all(k in mapped for k in ("sno", "description", "qty", "uom")):
-                return ridx, mapped
-        return None, {"sno": 0, "description": 1, "qty": 2, "uom": 3}
-
-    config_rows = []
-    component_rows = []
-
-    for pos, (start_row, number, solution_title_raw) in enumerate(solution_starts):
-        end_row = solution_starts[pos + 1][0] if pos + 1 < len(solution_starts) else len(raw)
-        config_name = f"Configuration {number}"
-        solution_title = " ".join(clean_text(solution_title_raw).split()) or f"Solution {number}"
-        header_row, column_map = find_header(start_row, end_row)
-        data_start = header_row + 1 if header_row is not None else start_row + 1
-
-        current_group = "A"
-        current_group_label = "A"
-
-        for ridx in range(data_start, end_row):
-            row = raw.iloc[ridx]
-            meaningful = nonempty_values(row)
-            if not meaningful:
-                continue
-
-            # Group headings are rows containing only the heading, e.g.
-            # B / B - Select Components / C: Optional.
-            if len(meaningful) == 1:
-                group_match = group_re.match(meaningful[0])
-                if group_match:
-                    current_group = group_match.group(1).upper()
-                    suffix = clean_text(group_match.group(2))
-                    current_group_label = f"{current_group} - {suffix}" if suffix else current_group
-                    continue
-
-            sno = cell(row, column_map.get("sno"))
-            description = cell(row, column_map.get("description"))
-            quantity = numeric(row.iloc[column_map["qty"]])
-            uom = cell(row, column_map.get("uom"))
-            part_code = cell(row, column_map.get("part"))
-            unit_cost = numeric(row.iloc[column_map["cost"]]) if "cost" in column_map else float("nan")
-
-            if norm(sno) in {"SNO", "SERIALNO", "SERIALNUMBER", "SRNO"}:
-                continue
-            if norm(description) in {"DESCRIPTION", "DESC", "ITEMDESCRIPTION"}:
-                continue
-            if not sno and not description and not part_code:
-                continue
-
-            qty_value = float(quantity) if pd.notna(quantity) else 0.0
-            selection_key = f"MR-{number}-{current_group}-{ridx}"
-
-            component_rows.append({
-                "MDC Type": "Multirack",
-                "Configuration": config_name,
-                "Configuration Title": solution_title,
-                "Group": current_group,
-                "Group Label": current_group_label,
-                "S.No.": sno,
-                "Description": description,
-                "Quantity": qty_value,
-                "UOM": uom or "EA",
-                "Part Code": part_code,
-                "Unit Cost": unit_cost,
-                "Selection Key": selection_key,
-            })
-
-        config_rows.append({
-            "MDC Type": "Multirack",
-            "Configuration": config_name,
-            "Configuration Title": solution_title,
-            "Base Cost": 0.0,
-        })
-
-    existing = {r["Configuration"] for r in config_rows}
-    for number in range(1, 10):
-        name = f"Configuration {number}"
-        if name not in existing:
-            config_rows.append({
-                "MDC Type": "Multirack",
-                "Configuration": name,
-                "Configuration Title": f"Solution {number}",
-                "Base Cost": 0.0,
-            })
-
-    configs = pd.DataFrame(config_rows)
-    configs["_sort"] = configs["Configuration"].str.extract(r"(\d+)")[0].astype(int)
-    configs = configs.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
-
-    components = pd.DataFrame(component_rows)
-    if components.empty:
-        components = empty_components.copy()
-
-    return configs, components
 
 
 try:
     configs_df, components_df, accessories_df, pdus_df, multirack_components_df = load_master(
-    master_mtime=file_mtime(MASTER_FILE),
-    multirack_mtime=file_mtime(MULTIRACK_FILE),
-)
+        master_mtime=os.path.getmtime(MASTER_FILE),
+        multirack_mtime=os.path.getmtime(MULTIRACK_FILE) if os.path.exists(MULTIRACK_FILE) else 0.0,
+    )
 except Exception as exc:
-    st.error("Unable to load MDC_Master_V1.xlsx.")
+    st.error("Unable to load MDC master / Multirack workbook.")
     st.exception(exc)
     st.stop()
 
@@ -891,6 +933,8 @@ defaults = {
     "configuration": "Configuration 1",
     "accessory_qty": {},
     "pdu_qty": {},
+    "multirack_selected": {},
+    "multirack_common_selected": {},
     "margin_pct": 20.0,
     "freight": 100000.0,
     "installation": 150000.0,
@@ -900,7 +944,6 @@ defaults = {
     "user_code": "—",
     "user_count": 0,
     "session_counted": False,
-    "multirack_selected": {},
 }
 
 for key, value in defaults.items():
@@ -973,6 +1016,19 @@ def generate_user_code():
     if config_text:
         number = config_text.split()[-1]
         codes.append(f"C{number}")
+
+    # Multirack uses the selected solution number plus common selections.
+    # The component list itself is Excel-driven and does not use the
+    # Single Rack accessory/PDU code mapping.
+    if st.session_state.mdc_type == "Multirack":
+        selected_common_count = sum(
+            1
+            for value in st.session_state.multirack_common_selected.values()
+            if value
+        )
+        if selected_common_count:
+            codes.append(f"MR{selected_common_count}")
+        return "-".join(codes) if codes else "—"
 
     # Fire suppression is detected from Excel descriptions.
     fire_selected = []
@@ -1176,24 +1232,86 @@ def selected_components():
 
 
 def selected_multirack_components():
-    """A is always included; B/C are included only when selected."""
+    """
+    A-category rows are always included for the selected solution.
+    B/C rows are included only when their checkbox is selected.
+    """
     if st.session_state.mdc_type != "Multirack":
         return pd.DataFrame(columns=multirack_components_df.columns)
 
     rows = multirack_components_df[
         (multirack_components_df["MDC Type"] == "Multirack")
-        & (multirack_components_df["Configuration"] == st.session_state.configuration)
+        & (
+            multirack_components_df["Configuration"]
+            == st.session_state.configuration
+        )
     ].copy()
+
     if rows.empty:
         return rows
 
     selected_keys = {
-        str(key) for key, selected in st.session_state.multirack_selected.items() if selected
+        str(key)
+        for key, selected in st.session_state.multirack_selected.items()
+        if selected
     }
-    is_a = rows["Group"].astype(str).str.upper().eq("A")
-    is_selected_optional = rows["Selection Key"].astype(str).isin(selected_keys)
-    return rows[is_a | is_selected_optional].copy()
 
+    is_a = (
+        rows["Group"]
+        .astype(str)
+        .str.upper()
+        .eq("A")
+    )
+
+    optional_selected = (
+        rows["Selection Key"]
+        .astype(str)
+        .isin(selected_keys)
+    )
+
+    return rows[is_a | optional_selected].copy()
+
+
+def selected_multirack_common_components():
+    """
+    Return the deduplicated B/C common pool.
+    Common items are displayed once even though they occur under
+    multiple solutions in the source workbook.
+    """
+    if st.session_state.mdc_type != "Multirack":
+        return pd.DataFrame(columns=multirack_components_df.columns)
+
+    rows = multirack_components_df[
+        multirack_components_df["Group"]
+        .astype(str)
+        .str.upper()
+        .isin(["B", "C"])
+    ].copy()
+
+    if rows.empty:
+        return rows
+
+    # Deduplicate the common pool by the actual BOQ identity.
+    rows["_common_key"] = rows.apply(
+        lambda r: (
+            f"{clean_text(r.get('Description')).upper()}|"
+            f"{clean_text(r.get('Quantity'))}|"
+            f"{clean_text(r.get('UOM')).upper()}"
+        ),
+        axis=1,
+    )
+    rows = rows.drop_duplicates("_common_key", keep="first").drop(
+        columns=["_common_key"]
+    )
+
+    rows["Common Selection Key"] = rows.apply(
+        lambda r: (
+            f"MR-COMMON-{re.sub(r'[^A-Z0-9]+', '', clean_text(r.get('Description')).upper())}"
+        ),
+        axis=1,
+    )
+
+    return rows
 
 
 # ============================================================
@@ -1204,24 +1322,25 @@ def build_bom():
     rows = []
 
     # --------------------------------------------------------
-    # MULTIRACK / SINGLE-RACK BASE CONFIGURATION
+    # MULTIRACK
+    # A = selected solution components
+    # B/C = selected common components
     # --------------------------------------------------------
-    # Multirack components come from the selected A/B/C group rows.
-    # The current workbook has no Part Code/Cost, so those values remain
-    # blank. If Part Code/Cost is added later, the parser reads them and
-    # the same BOM logic uses them automatically.
     if st.session_state.mdc_type == "Multirack":
         for _, r in selected_multirack_components().iterrows():
             qty = numeric(r.get("Quantity"))
             unit_cost = numeric(r.get("Unit Cost"))
-            part_code = clean_text(r.get("Part Code"))
 
             rows.append({
-                "S.No.": clean_text(r.get("S.No.")),
-                "Component Type": clean_text(r.get("Group")) or "Multirack",
-                "Part Code": part_code,
+                "S.No.": len(rows) + 1,
+                "Component Type": (
+                    f"Multirack Category {clean_text(r.get('Group'))}"
+                ),
+                "Part Code": clean_text(r.get("Part Code")),
                 "Description": clean_text(r.get("Description")),
-                "Quantity": float(qty) if pd.notna(qty) else "",
+                "Quantity": (
+                    float(qty) if pd.notna(qty) else 0.0
+                ),
                 "UOM": clean_text(r.get("UOM")) or "EA",
                 "Unit Cost": unit_cost,
                 "Total Cost": (
@@ -1229,46 +1348,83 @@ def build_bom():
                     if pd.notna(unit_cost) and pd.notna(qty)
                     else float("nan")
                 ),
-                "Unit Price": float("nan"),
-                "Total Price": float("nan"),
                 "Source": "Configuration",
             })
 
-    else:
-            # --------------------------------------------------------
-            # SINGLE-RACK BASE CONFIGURATION
-            # --------------------------------------------------------
-        main_mdc_added = False
+        common_pool = selected_multirack_common_components()
+        common_keys = {
+            str(key)
+            for key, selected in st.session_state.multirack_common_selected.items()
+            if selected
+        }
 
-        for _, r in selected_components().iterrows():
-            part_code = clean_text(r["Part Code"])
+        if common_keys and not common_pool.empty:
+            selected_common = common_pool[
+                common_pool["Common Selection Key"]
+                .astype(str)
+                .isin(common_keys)
+            ]
 
-            if part_code == "801029209":
-                if main_mdc_added:
-                    continue
-                main_mdc_added = True
+            for _, r in selected_common.iterrows():
+                qty = numeric(r.get("Quantity"))
+                unit_cost = numeric(r.get("Unit Cost"))
 
-            cost = numeric(r["Unit Cost"])
-            qty = numeric(r["Quantity"])
+                rows.append({
+                    "S.No.": len(rows) + 1,
+                    "Component Type": (
+                        f"Multirack Category {clean_text(r.get('Group'))}"
+                    ),
+                    "Part Code": clean_text(r.get("Part Code")),
+                    "Description": clean_text(r.get("Description")),
+                    "Quantity": (
+                        float(qty) if pd.notna(qty) else 0.0
+                    ),
+                    "UOM": clean_text(r.get("UOM")) or "EA",
+                    "Unit Cost": unit_cost,
+                    "Total Cost": (
+                        unit_cost * qty
+                        if pd.notna(unit_cost) and pd.notna(qty)
+                        else float("nan")
+                    ),
+                    "Source": "Configuration",
+                })
 
-            rows.append({
-                "S.No.": len(rows) + 1,
-                "Component Type": "Base (Configuration)",
-                "Part Code": clean_text(r["Part Code"]),
-                "Description": clean_text(r["Description"]),
-                "Quantity": 0 if pd.isna(qty) else float(qty),
-                "UOM": clean_text(r["UOM"]),
-                "Unit Cost": cost,
-                "Total Cost": (
-                    cost * qty
-                    if pd.notna(cost) and pd.notna(qty)
-                    else float("nan")
-                ),
-                "Source": "Configuration",
-            })
+        return pd.DataFrame(rows)
 
     # --------------------------------------------------------
-    # PDU
+    # SINGLE-RACK BASE CONFIGURATION
+    # --------------------------------------------------------
+    main_mdc_added = False
+
+    for _, r in selected_components().iterrows():
+        part_code = clean_text(r["Part Code"])
+
+        if part_code == "801029209":
+            if main_mdc_added:
+                continue
+            main_mdc_added = True
+
+        cost = numeric(r["Unit Cost"])
+        qty = numeric(r["Quantity"])
+
+        rows.append({
+            "S.No.": len(rows) + 1,
+            "Component Type": "Base (Configuration)",
+            "Part Code": clean_text(r["Part Code"]),
+            "Description": clean_text(r["Description"]),
+            "Quantity": 0 if pd.isna(qty) else float(qty),
+            "UOM": clean_text(r["UOM"]),
+            "Unit Cost": cost,
+            "Total Cost": (
+                cost * qty
+                if pd.notna(cost) and pd.notna(qty)
+                else float("nan")
+            ),
+            "Source": "Configuration",
+        })
+
+    # --------------------------------------------------------
+    # SINGLE-RACK PDU
     # --------------------------------------------------------
     for _, r in pdus_df.iterrows():
         part = clean_text(r["Part Code"])
@@ -1276,7 +1432,6 @@ def build_bom():
 
         if pd.notna(qty) and qty > 0:
             cost = numeric(r["Unit Cost"])
-
             c13_value = numeric(r["C13"])
             c19_value = numeric(r["C19"])
             c13_text = f"{c13_value:g}" if pd.notna(c13_value) else ""
@@ -1297,12 +1452,16 @@ def build_bom():
                 "Quantity": float(qty),
                 "UOM": clean_text(r["UOM"]),
                 "Unit Cost": cost,
-                "Total Cost": cost * qty if pd.notna(cost) else float("nan"),
+                "Total Cost": (
+                    cost * qty
+                    if pd.notna(cost)
+                    else float("nan")
+                ),
                 "Source": "PDU",
             })
 
     # --------------------------------------------------------
-    # OPTIONAL ACCESSORIES
+    # SINGLE-RACK OPTIONAL ACCESSORIES
     # --------------------------------------------------------
     accessory_lookup = {
         clean_text(r["Part Code"]): r
@@ -1330,12 +1489,15 @@ def build_bom():
             "Quantity": float(qty),
             "UOM": clean_text(r["UOM"]),
             "Unit Cost": cost,
-            "Total Cost": cost * qty if pd.notna(cost) else float("nan"),
+            "Total Cost": (
+                cost * qty
+                if pd.notna(cost)
+                else float("nan")
+            ),
             "Source": "Optional Accessory",
         })
 
     return pd.DataFrame(rows)
-
 
 def cost_summary(bom):
     if bom.empty:
@@ -1367,13 +1529,18 @@ def cost_summary(bom):
 
 def add_selling_prices(bom, total_cost, margin_pct, freight, installation):
     """
-    Keep the existing Single Rack pricing logic.
+    IMPORTANT PRICE LOGIC
 
-    For Multirack, A/B/C solution rows have blank Unit Cost when the
-    Multirack workbook does not provide costing. PDU and Other Accessories
-    still use the existing Single Rack pricing logic from MDC_Master_V1.xlsx.
-    If Part Code/Cost is later added to the Multirack workbook, those
-    solution rows are also handled automatically.
+    Unit Price:
+        Comes directly from the Unit Cost in MDC_Master_V1.xlsx.
+
+    Total Price:
+        Excel Unit Price x selected Quantity.
+
+    Final Selling Price:
+        Calculated separately from total cost using margin/freight/
+        installation. It is NOT distributed back into the Excel line
+        prices.
     """
     result = bom.copy()
 
@@ -1425,31 +1592,43 @@ def build_sales_boq(bom):
             columns=["S.No.", "Description", "Quantity", "UOM"]
         )
 
-    # Multirack keeps the exact selected S.No./Description/Qty/UOM from
-    # MULTIRACK BOQ.xlsx. The pricing columns remain available only in the
-    # detailed Excel/PDF export and are intentionally blank.
-    if st.session_state.mdc_type == "Multirack":
-        output_rows = []
+    work = bom.copy()
 
-        for _, row in bom.iterrows():
-            description = clean_text(row.get("Description"))
+    # Multirack BOQ is already in the requested S.No./Description/Qty/UOM
+    # structure from MULTIRACK BOQ.xlsx; do not apply Single Rack
+    # cooling/camera compaction rules to it.
+    if st.session_state.mdc_type == "Multirack":
+        selected_config = selected_config_record()
+        selected_config_title = (
+            clean_text(selected_config.get("Configuration Title", ""))
+            if selected_config is not None
+            else ""
+        )
+
+        output_rows = []
+        component_number = 1
+
+        if selected_config_title:
+            # The export/UI renderer adds the title as a separate merged row.
+            pass
+
+        for _, item in work.iterrows():
+            description = clean_text(item.get("Description"))
             if not description:
                 continue
 
-            qty = numeric(row.get("Quantity"))
             output_rows.append({
-                "S.No.": clean_text(row.get("S.No.")),
+                "S.No.": clean_text(item.get("S.No.")) or str(component_number),
                 "Description": description,
-                "Quantity": float(qty) if pd.notna(qty) else "",
-                "UOM": clean_text(row.get("UOM")) or "EA",
+                "Quantity": numeric(item.get("Quantity")),
+                "UOM": clean_text(item.get("UOM")) or "EA",
             })
+            component_number += 1
 
         return pd.DataFrame(
             output_rows,
             columns=["S.No.", "Description", "Quantity", "UOM"],
         )
-
-    work = bom.copy()
 
     selected_config_components = selected_components()
     cooling_part_codes = set()
@@ -1663,15 +1842,8 @@ def excel_bytes(
     if bom is None:
         bom = build_bom()
 
-    # Single Rack Sales remains compact. Multirack exports use the same
-    # detailed columns as the existing cost export, but pricing fields are
-    # intentionally blank because the Multirack source has no pricing data.
-    detailed_output = internal or st.session_state.mdc_type == "Multirack"
-    display_bom = (
-        bom
-        if detailed_output
-        else build_sales_boq(bom)
-    )
+    # Sales output is compact; internal output remains detailed.
+    display_bom = build_sales_boq(bom) if not internal else bom
 
     # --------------------------------------------------------
     # GET FINAL PRICE SAFELY
@@ -1752,7 +1924,7 @@ def excel_bytes(
         # Component Type intentionally removed
         # ----------------------------------------------------
 
-        if detailed_output:
+        if internal:
 
             headers = [
                 "S.No.",
@@ -1841,7 +2013,7 @@ def excel_bytes(
 
         for _, r in display_bom.iterrows():
 
-            if detailed_output:
+            if internal:
 
                 values = [
                     r.get("S.No."),
@@ -1896,23 +2068,7 @@ def excel_bytes(
 
         summary_start = row_no
 
-        if detailed_output and st.session_state.mdc_type == "Multirack":
-
-            summary = [
-                ("Base Cost", None),
-                ("Optional Cost", None),
-                ("PDU Cost", None),
-                ("Total Cost", None),
-                ("Margin %", None),
-                ("Margin Price", None),
-                ("Freight", None),
-                ("Installation", None),
-                ("Warranty %", None),
-                ("Warranty Amount", None),
-                ("Final Selling Price", None),
-            ]
-
-        elif internal:
+        if internal:
 
             summary = [
                 ("Base Cost", base_cost),
@@ -1923,15 +2079,27 @@ def excel_bytes(
                 ("Margin Price", margin_price),
                 ("Freight", freight),
                 ("Installation", installation),
-                ("Warranty %", warranty_pct),
-                ("Warranty Amount", margin_price * warranty_pct / 100),
-                ("Final Selling Price", final_price),
+                (
+                    "Warranty %",
+                    warranty_pct
+                ),
+                (
+                    "Warranty Amount",
+                    margin_price * warranty_pct / 100
+                ),
+                (
+                    "Final Selling Price",
+                    final_price
+                ),
             ]
 
         else:
 
             summary = [
-                ("Final Selling Price", final_price),
+                (
+                    "Final Selling Price",
+                    final_price
+                ),
             ]
 
         for label, value in summary:
@@ -1942,13 +2110,12 @@ def excel_bytes(
                 value=label
             )
 
-            if value is None or (isinstance(value, float) and pd.isna(value)):
-                numeric_value = None
-            else:
-                try:
-                    numeric_value = float(numeric(value))
-                except Exception:
-                    numeric_value = None
+            try:
+                numeric_value = float(
+                    numeric(value)
+                )
+            except Exception:
+                numeric_value = 0.0
 
             ws.cell(
                 row=row_no,
@@ -2068,7 +2235,7 @@ def excel_bytes(
                 horizontal="center"
             )
 
-            if detailed_output:
+            if internal:
 
                 ws.cell(
                     rr,
@@ -2229,7 +2396,7 @@ def excel_bytes(
         # COLUMN WIDTHS
         # ====================================================
 
-        if detailed_output:
+        if internal:
 
             widths = {
                 1: 10,
@@ -2306,10 +2473,8 @@ def pdf_bytes(internal=False, bom=None, final_price=0.0):
     if bom is None:
         bom = build_bom()
 
-    # Single Rack Sales remains compact. Multirack PDF uses the detailed
-    # table so Part Code and all pricing columns are present but blank.
-    detailed_output = internal or st.session_state.mdc_type == "Multirack"
-    display_bom = bom if detailed_output else build_sales_boq(bom)
+    # Sales PDF uses the compact display BOM; internal PDF is unchanged.
+    display_bom = build_sales_boq(bom) if not internal else bom
 
     # --------------------------------------------------------
     # FINAL PRICE
@@ -2511,7 +2676,7 @@ def pdf_bytes(internal=False, bom=None, final_price=0.0):
     # Component Type / Type is NOT included.
     # ========================================================
 
-    if detailed_output:
+    if internal:
 
         headers = [
             "S.No.",
@@ -2592,7 +2757,7 @@ def pdf_bytes(internal=False, bom=None, final_price=0.0):
             center_small
         )
 
-        if detailed_output:
+        if internal:
 
             part_code = Paragraph(
                 clean_text(
@@ -2640,7 +2805,7 @@ def pdf_bytes(internal=False, bom=None, final_price=0.0):
     # PDF COLUMN WIDTHS
     # ========================================================
 
-    if detailed_output:
+    if internal:
 
         widths = [
             12 * mm,   # S.No.
@@ -2804,7 +2969,7 @@ def pdf_bytes(internal=False, bom=None, final_price=0.0):
         ),
     ])
 
-    if detailed_output:
+    if internal:
         boq_style_commands.extend([
             (
                 "ALIGN",
@@ -2845,17 +3010,7 @@ def pdf_bytes(internal=False, bom=None, final_price=0.0):
     # PRICE SUMMARY
     # ========================================================
 
-    if st.session_state.mdc_type == "Multirack":
-
-        summary_data = [
-            ["Base Cost", "", "Optional Cost", ""],
-            ["PDU Cost", "", "Total Cost", ""],
-            ["Margin %", "", "Margin Price", ""],
-            ["Freight", "", "Installation", ""],
-            ["Warranty %", "", "Warranty Amount", ""],
-        ]
-
-    elif internal:
+    if internal:
 
         summary_data = [
             [
@@ -3020,7 +3175,7 @@ def pdf_bytes(internal=False, bom=None, final_price=0.0):
         [
             [
                 "FINAL SELLING PRICE",
-                "" if st.session_state.mdc_type == "Multirack" else money(final_price)
+                money(final_price)
             ]
         ],
         colWidths=[
@@ -3444,8 +3599,8 @@ is_internal = (
 
 # ============================================================
 # MAIN CONFIGURATION AREA
-# LEFT  = MDC + Multirack A/B/C + PDU
-# RIGHT = Other Accessories
+# LEFT  = MDC + PDU
+# RIGHT = ACCESSORIES
 # ============================================================
 
 main_left, main_right = st.columns(
@@ -3455,12 +3610,16 @@ main_left, main_right = st.columns(
 
 # ============================================================
 # LEFT SIDE
+# 01. MDC TYPE & CONFIGURATION
+# 02. PDU SELECTION
 # ============================================================
+
 with main_left:
 
     # ========================================================
     # 01. MDC TYPE & CONFIGURATION
     # ========================================================
+
     with st.container(border=True):
 
         st.markdown(
@@ -3471,34 +3630,68 @@ with main_left:
             unsafe_allow_html=True,
         )
 
+        # ----------------------------------------------------
+        # MDC TYPE
+        # ----------------------------------------------------
+
         mdc_type = st.radio(
             "MDC Type",
             ["Single Rack", "Multirack"],
             horizontal=True,
-            index=(0 if st.session_state.mdc_type == "Single Rack" else 1),
+            index=(
+                0
+                if st.session_state.mdc_type == "Single Rack"
+                else 1
+            ),
         )
 
         if mdc_type != st.session_state.mdc_type:
+
             st.session_state.mdc_type = mdc_type
             st.session_state.configuration = "Configuration 1"
             st.session_state.accessory_qty = {}
             st.session_state.pdu_qty = {}
             st.session_state.multirack_selected = {}
-            st.session_state.configuration_id = generate_configuration_id()
+            st.session_state.multirack_common_selected = {}
+            st.session_state.configuration_id = (
+                generate_configuration_id()
+            )
             st.session_state.configuration_saved = False
+
             st.rerun()
 
+        # ----------------------------------------------------
+        # CONFIGURATION
+        # ----------------------------------------------------
+
         available = configs_df[
-            configs_df["MDC Type"] == st.session_state.mdc_type
+            configs_df["MDC Type"]
+            == st.session_state.mdc_type
         ].copy()
 
         labels = available["Configuration"].tolist()
 
         configuration_display_names = {
-            "Configuration 1": "Configuration 1 - 1SR, 42U×800W×1200D, 3.5KW, W/O Dehumidifier",
-            "Configuration 2": "Configuration 2 - 1SR, 42U×800W×1200D, 3.5KW, Dehumidifier",
-            "Configuration 3": "Configuration 3 - 1SR, 42U×800W×1200D, 7KW, W/O Dehumidifier",
-            "Configuration 4": "Configuration 4 - 1SR, 42U×800W×1200D, 7KW, Dehumidifier",
+
+            "Configuration 1":
+                "Configuration 1 - "
+                "1SR, 42U×800W×1200D, 3.5KW, "
+                "W/O Dehumidifier",
+
+            "Configuration 2":
+                "Configuration 2 - "
+                "1SR, 42U×800W×1200D, 3.5KW, "
+                "Dehumidifier",
+
+            "Configuration 3":
+                "Configuration 3 - "
+                "1SR, 42U×800W×1200D, 7KW, "
+                "W/O Dehumidifier",
+
+            "Configuration 4":
+                "Configuration 4 - "
+                "1SR, 42U×800W×1200D, 7KW, "
+                "Dehumidifier",
         }
 
         if labels:
@@ -3509,7 +3702,8 @@ with main_left:
                 labels,
                 index=(
                     labels.index(old_configuration)
-                    if old_configuration in labels else 0
+                    if old_configuration in labels
+                    else 0
                 ),
                 format_func=lambda x: (
                     configuration_display_names.get(x, x)
@@ -3524,430 +3718,997 @@ with main_left:
                 key="configuration_selection",
             )
 
-            if selected_configuration != old_configuration:
-                st.session_state.configuration = selected_configuration
-                st.session_state.multirack_selected = {}
-            else:
-                st.session_state.configuration = selected_configuration
+            st.session_state.configuration = selected_configuration
 
-    # ========================================================
-    # 02. MULTIRACK SOLUTION COMPONENTS
-    # Read directly from MULTIRACK BOQ.xlsx.
-    # A = main configuration; B/C = optional selections.
-    # ========================================================
-    if st.session_state.mdc_type == "Multirack":
+            if selected_configuration != old_configuration:
+                st.session_state.multirack_selected = {}
+                st.session_state.multirack_common_selected = {}
+
+
+    if st.session_state.mdc_type == "Single Rack":
+
+        # ========================================================
+        # 02. PDU SELECTION
+        # ========================================================
+
         with st.container(border=True):
+
             st.markdown(
                 '<div class="mdc-card-heading">'
                 '<span class="mdc-number">02</span>'
-                '<span>SOLUTION COMPONENTS</span>'
+                '<span>PDU SELECTION</span>'
                 '</div>',
                 unsafe_allow_html=True,
             )
 
-            all_mr_rows = multirack_components_df[
-                (multirack_components_df["MDC Type"] == "Multirack")
-                & (multirack_components_df["Configuration"] == st.session_state.configuration)
-            ].copy()
+            # ----------------------------------------------------
+            # PDU TYPES FROM EXCEL
+            # ----------------------------------------------------
 
-            if all_mr_rows.empty:
-                if not os.path.exists(MULTIRACK_FILE):
-                    st.warning("MULTIRACK BOQ.xlsx was not found in the app folder.")
-                else:
-                    st.info(
-                        f"No components were found for {st.session_state.configuration} "
-                        f"in the Multirack Excel workbook."
+            pdu_type_display = {
+                "BASIC": "Basic PDU",
+                "METERED": "Metered PDU",
+                "SWITCHED": "Switched PDU",
+                "MANAGED": "Managed PDU",
+            }
+
+            excel_pdu_types = []
+
+            if not pdus_df.empty:
+
+                excel_pdu_types = [
+                    x
+                    for x in (
+                        pdus_df["Type"]
+                        .astype(str)
+                        .str.strip()
+                        .str.upper()
+                        .unique()
+                        .tolist()
                     )
-            else:
-                encountered_groups = []
-                for group in all_mr_rows["Group"].astype(str):
-                    if group not in encountered_groups:
-                        encountered_groups.append(group)
+                    if x
+                ]
 
-                group_order = []
-                for preferred in ["A", "B", "C"]:
-                    if preferred in encountered_groups:
-                        group_order.append(preferred)
-                for group in encountered_groups:
-                    if group not in group_order:
-                        group_order.append(group)
-
-                for group in group_order:
-                    group_rows = all_mr_rows[
-                        all_mr_rows["Group"].astype(str) == str(group)
-                    ].copy()
-                    if group_rows.empty:
-                        continue
-
-                    labels = (
-                        group_rows["Group Label"].dropna().astype(str).str.strip().tolist()
-                        if "Group Label" in group_rows.columns else []
-                    )
-                    group_label = next((x for x in labels if x), group)
-
-                    st.markdown(
-                        f'<div class="mdc-mini-heading" style="text-align:center;">'
-                        f'{clean_text(group_label)}</div>',
-                        unsafe_allow_html=True,
-                    )
-
-                    for _, mr in group_rows.iterrows():
-                        selection_key = clean_text(mr.get("Selection Key"))
-                        description = clean_text(mr.get("Description"))
-                        qty = numeric(mr.get("Quantity"))
-                        qty_text = f"{qty:g}" if pd.notna(qty) else ""
-                        uom = clean_text(mr.get("UOM")) or "EA"
-                        if not description:
-                            continue
-
-                        label = description
-                        if qty_text:
-                            label = f"{description} ({qty_text} {uom})"
-
-                        if str(group).upper() == "A":
-                            st.markdown(
-                                f'<div style="padding:4px 6px;color:#334155;">'
-                                f'<span style="font-weight:700;">✓</span>&nbsp;{label}'
-                                f'</div>',
-                                unsafe_allow_html=True,
-                            )
-                        else:
-                            selected = st.checkbox(
-                                label,
-                                value=bool(st.session_state.multirack_selected.get(selection_key, False)),
-                                key=f"mr_component_{selection_key}",
-                            )
-                            st.session_state.multirack_selected[selection_key] = selected
-    # ========================================================
-    # 03. PDU SELECTION
-    # EXACTLY THE SAME PDU LOGIC AS SINGLE RACK
-    # ========================================================
-    with st.container(border=True):
-        st.markdown(
-            '<div class="mdc-card-heading">'
-            '<span class="mdc-number">'
-            + ("03" if st.session_state.mdc_type == "Multirack" else "02")
-            + '</span>'
-            '<span>PDU SELECTION</span>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-        pdu_type_display = {
-            "BASIC": "Basic PDU",
-            "METERED": "Metered PDU",
-            "SWITCHED": "Switched PDU",
-            "MANAGED": "Managed PDU",
-        }
-
-        excel_pdu_types = []
-        if not pdus_df.empty:
-            excel_pdu_types = [
-                x for x in (
-                    pdus_df["Type"].astype(str).str.strip().str.upper().unique().tolist()
-                ) if x
+            pdu_types = ["None"] + [
+                pdu_type_display.get(
+                    x,
+                    f"{x.title()} PDU"
+                )
+                for x in excel_pdu_types
             ]
 
-        pdu_types = ["None"] + [
-            pdu_type_display.get(x, f"{x.title()} PDU")
-            for x in excel_pdu_types
-        ]
+            # ----------------------------------------------------
+            # PDU TYPE + MODEL + QUANTITY
+            # ----------------------------------------------------
 
-        pdu_col1, pdu_col2, pdu_col3 = st.columns(
-            [1.0, 2.0, 0.55], gap="small"
-        )
-
-        with pdu_col1:
-            previous_pdu_type = st.session_state.get(
-                "pdu_type_selection", "None"
-            )
-            if previous_pdu_type not in pdu_types:
-                previous_pdu_type = "None"
-
-            selected_pdu_type = st.selectbox(
-                "PDU Type",
-                pdu_types,
-                index=pdu_types.index(previous_pdu_type),
-                key="pdu_type_selection",
+            pdu_col1, pdu_col2, pdu_col3 = st.columns(
+                [1.0, 2.0, 0.55],
+                gap="small"
             )
 
-        selected_part = None
+            # ----------------------------------------------------
+            # PDU TYPE
+            # ----------------------------------------------------
 
-        with pdu_col2:
-            if selected_pdu_type != "None":
-                reverse_type = {
-                    v: k for k, v in pdu_type_display.items()
-                }
-                excel_pdu_type = reverse_type.get(
-                    selected_pdu_type,
-                    selected_pdu_type.replace(" PDU", "").upper(),
+            with pdu_col1:
+
+                previous_pdu_type = st.session_state.get(
+                    "pdu_type_selection",
+                    "None"
                 )
 
-                filtered_pdus = pdus_df[
-                    pdus_df["Type"].astype(str).str.strip().str.upper()
-                    == excel_pdu_type
-                ].copy()
+                if previous_pdu_type not in pdu_types:
+                    previous_pdu_type = "None"
 
-                if not filtered_pdus.empty:
-                    pdu_options = [
-                        f'{clean_text(r["Part Code"])} — {clean_text(r["Description"])}'
-                        for _, r in filtered_pdus.iterrows()
-                    ]
-                    old_selection = st.session_state.get("pdu_model_selection")
-                    pdu_index = (
-                        pdu_options.index(old_selection)
-                        if old_selection in pdu_options else 0
+                selected_pdu_type = st.selectbox(
+                    "PDU Type",
+                    pdu_types,
+                    index=pdu_types.index(
+                        previous_pdu_type
+                    ),
+                    key="pdu_type_selection",
+                )
+
+            # ----------------------------------------------------
+            # PDU MODEL
+            # ----------------------------------------------------
+
+            selected_part = None
+
+            with pdu_col2:
+
+                if selected_pdu_type != "None":
+
+                    reverse_type = {
+                        v: k
+                        for k, v in pdu_type_display.items()
+                    }
+
+                    excel_pdu_type = reverse_type.get(
+                        selected_pdu_type,
+                        selected_pdu_type
+                        .replace(" PDU", "")
+                        .upper(),
                     )
 
-                    selected_pdu = st.selectbox(
-                        "Select PDU",
-                        pdu_options,
-                        index=pdu_index,
-                        key="pdu_model_selection",
+                    filtered_pdus = pdus_df[
+                        pdus_df["Type"]
+                        .astype(str)
+                        .str.strip()
+                        .str.upper()
+                        == excel_pdu_type
+                    ].copy()
+
+                    if not filtered_pdus.empty:
+
+                        pdu_options = [
+                            f'{clean_text(r["Part Code"])} — '
+                            f'{clean_text(r["Description"])}'
+                            for _, r in filtered_pdus.iterrows()
+                        ]
+
+                        old_selection = (
+                            st.session_state.get(
+                                "pdu_model_selection"
+                            )
+                        )
+
+                        pdu_index = (
+                            pdu_options.index(old_selection)
+                            if old_selection in pdu_options
+                            else 0
+                        )
+
+                        selected_pdu = st.selectbox(
+                            "Select PDU",
+                            pdu_options,
+                            index=pdu_index,
+                            key="pdu_model_selection",
+                        )
+
+                        selected_row = filtered_pdus.iloc[
+                            pdu_options.index(selected_pdu)
+                        ]
+
+                        selected_part = clean_text(
+                            selected_row["Part Code"]
+                        )
+
+                    else:
+
+                        st.warning(
+                            f"No {selected_pdu_type} options "
+                            "found in MDC_Master_V1.xlsx."
+                        )
+
+            # ----------------------------------------------------
+            # PDU QUANTITY
+            # ----------------------------------------------------
+
+            with pdu_col3:
+
+                if selected_part:
+
+                    current_pdu_qty = int(
+                        numeric(
+                            st.session_state.pdu_qty.get(
+                                selected_part,
+                                1
+                            )
+                        )
                     )
-                    selected_row = filtered_pdus.iloc[pdu_options.index(selected_pdu)]
-                    selected_part = clean_text(selected_row["Part Code"])
+
+                    pdu_quantity = st.number_input(
+                        "Qty",
+                        min_value=1,
+                        max_value=999,
+                        step=1,
+                        value=current_pdu_qty,
+                        key=f"pdu_quantity_{selected_part}",
+                    )
+
+                    st.session_state.pdu_qty = {
+                        selected_part: pdu_quantity
+                    }
+
                 else:
-                    st.warning(
-                        f"No {selected_pdu_type} options found in MDC_Master_V1.xlsx."
+
+                    st.number_input(
+                        "Qty",
+                        min_value=1,
+                        max_value=999,
+                        value=1,
+                        step=1,
+                        disabled=True,
+                        key="pdu_quantity_none",
                     )
 
-        with pdu_col3:
-            if selected_part:
-                current_pdu_qty = int(
-                    numeric(st.session_state.pdu_qty.get(selected_part, 1))
-                )
-                pdu_quantity = st.number_input(
-                    "Qty",
-                    min_value=1,
-                    max_value=999,
-                    step=1,
-                    value=current_pdu_qty,
-                    key=f"pdu_quantity_{selected_part}",
-                )
-                st.session_state.pdu_qty = {selected_part: pdu_quantity}
-            else:
-                st.number_input(
-                    "Qty",
-                    min_value=1,
-                    max_value=999,
-                    value=1,
-                    step=1,
-                    disabled=True,
-                    key="pdu_quantity_none",
-                )
-                st.session_state.pdu_qty = {}
-
+                    st.session_state.pdu_qty = {}
 
 # ============================================================
 # RIGHT SIDE
-# 04 OTHER ACCESSORIES FOR MULTIRACK / 03 FOR SINGLE RACK
-# EXACTLY THE SAME EXCEL-DRIVEN ACCESSORY SELECTION
+# 03. OTHER ACCESSORIES
 # ============================================================
-with main_right:
 
-    with st.container(border=True):
-        st.markdown(
-            '<div class="mdc-card-heading">'
-            '<span class="mdc-number">'
-            + ("04" if st.session_state.mdc_type == "Multirack" else "03")
-            + '</span>'
-            '<span>OTHER ACCESSORIES</span>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
+if st.session_state.mdc_type == "Single Rack":
+    with main_right:
 
-        optional_lookup = {
-            clean_text(r["Part Code"]): r
-            for _, r in accessories_df.iterrows()
-            if clean_text(r["Part Code"])
-        }
+        with st.container(border=True):
 
-        def excel_optional_rows(keyword=None):
-            if accessories_df.empty:
-                return pd.DataFrame()
-            if not keyword:
-                return accessories_df.copy()
-            key = str(keyword).upper()
-            mask = (
-                accessories_df["Part Code"].astype(str).str.upper().str.contains(key, na=False)
-                | accessories_df["Description"].astype(str).str.upper().str.contains(key, na=False)
+            st.markdown(
+                '<div class="mdc-card-heading">'
+                '<span class="mdc-number">03</span>'
+                '<span>OTHER ACCESSORIES</span>'
+                '</div>',
+                unsafe_allow_html=True,
             )
-            return accessories_df[mask].copy()
+    # # ============================================================
+    # # LEFT PANEL
+    # # 01 MDC TYPE & CONFIGURATION
+    # # 02 PDU SELECTION
+    # # ============================================================
 
-        def remove_rows(rows):
-            for _, r in rows.iterrows():
-                part = clean_text(r["Part Code"])
-                if part:
-                    st.session_state.accessory_qty.pop(part, None)
+    # with main_left:
 
-        def add_rows(rows, quantity=1):
-            for _, r in rows.iterrows():
-                part = clean_text(r["Part Code"])
-                if part:
-                    st.session_state.accessory_qty[part] = quantity
+    #     # ========================================================
+    #     # 01. MDC TYPE & CONFIGURATION
+    #     # ========================================================
 
-        # ----------------------------------------------------
-        # FIRE SUPPRESSION
-        # ----------------------------------------------------
-        fire_rows = excel_optional_rows("FIRE")
-        external_fire = fire_rows[
-            fire_rows["Description"].astype(str).str.upper().str.contains("EXTERNAL", na=False)
-        ].copy()
-        internal_fire = fire_rows[
-            ~fire_rows["Description"].astype(str).str.upper().str.contains("EXTERNAL", na=False)
-        ].copy()
+    #     with st.container(border=True):
 
-        fire_current = "None"
-        if any(
-            numeric(st.session_state.accessory_qty.get(p, 0)) > 0
-            for p in external_fire["Part Code"].astype(str).str.strip()
-        ):
-            fire_current = "External"
-        elif any(
-            numeric(st.session_state.accessory_qty.get(p, 0)) > 0
-            for p in internal_fire["Part Code"].astype(str).str.strip()
-        ):
-            fire_current = "Internal"
+    #         st.markdown(
+    #             '<div class="mdc-card-heading">'
+    #             '<span class="mdc-number">01</span>'
+    #             '<span>MDC TYPE &amp; CONFIGURATION</span>'
+    #             '</div>',
+    #             unsafe_allow_html=True,
+    #         )
 
-        fire_selection = st.radio(
-            "Fire Suppression",
-            ["None", "External", "Internal"],
-            index=["None", "External", "Internal"].index(fire_current),
-            horizontal=True,
-            key="fire_suppression_selection",
-        )
+    #         mdc_type = st.radio(
+    #             "MDC Type",
+    #             ["Single Rack", "Multirack"],
+    #             horizontal=True,
+    #             index=(
+    #                 0
+    #                 if st.session_state.mdc_type == "Single Rack"
+    #                 else 1
+    #             ),
+    #             key="mdc_type_selection",
+    #         )
 
-        remove_rows(external_fire)
-        remove_rows(internal_fire)
-        if fire_selection == "External":
-            add_rows(external_fire, 1)
-        elif fire_selection == "Internal":
-            add_rows(internal_fire, 1)
+    #         if mdc_type != st.session_state.mdc_type:
 
-        # ----------------------------------------------------
-        # CAMERA
-        # ----------------------------------------------------
-        all_camera_rows = excel_optional_rows("CAMERA")
-        four_tb_rows = (
-            all_camera_rows[
-                all_camera_rows["Description"].astype(str).str.upper().str.contains("4TB", na=False)
-            ].copy()
-            if not all_camera_rows.empty else pd.DataFrame()
-        )
-        remove_rows(four_tb_rows)
+    #             st.session_state.mdc_type = mdc_type
+    #             st.session_state.configuration = "Configuration 1"
+    #             st.session_state.accessory_qty = {}
+    #             st.session_state.pdu_qty = {}
+    #             st.session_state.configuration_id = generate_configuration_id()
+    #             st.session_state.configuration_saved = False
 
-        camera_rows = (
-            all_camera_rows[
-                ~all_camera_rows["Description"].astype(str).str.upper().str.contains("4TB", na=False)
-            ].copy()
-            if not all_camera_rows.empty else pd.DataFrame()
-        )
-        camera_parts = (
-            camera_rows["Part Code"].astype(str).str.strip().tolist()
-            if not camera_rows.empty else []
-        )
-        camera_current = any(
-            numeric(st.session_state.accessory_qty.get(p, 0)) > 0
-            for p in camera_parts
-        )
+    #             st.rerun()
 
-        cam_col1, cam_col2 = st.columns(
-            [4.5, 1.15], gap="small", vertical_alignment="center"
-        )
-        with cam_col1:
-            camera_selection = st.checkbox(
-                "Camera",
-                value=camera_current,
-                key="camera_system_selection",
-            )
-        with cam_col2:
-            if camera_selection:
-                current_camera_qty = max(
-                    [
-                        int(numeric(st.session_state.accessory_qty.get(p, 0)))
-                        for p in camera_parts
-                        if numeric(st.session_state.accessory_qty.get(p, 0)) > 0
-                    ] + [1]
+    #         available = configs_df[
+    #             configs_df["MDC Type"] == st.session_state.mdc_type
+    #         ].copy()
+
+    #         labels = available["Configuration"].tolist()
+
+    #         configuration_display_names = {
+    #             "Configuration 1":
+    #                 "Configuration 1 - 1SR, 42U×800W×1200D, 3.5KW, W/O Dehumidifier",
+
+    #             "Configuration 2":
+    #                 "Configuration 2 - 1SR, 42U×800W×1200D, 3.5KW, Dehumidifier",
+
+    #             "Configuration 3":
+    #                 "Configuration 3 - 1SR, 42U×800W×1200D, 7KW, W/O Dehumidifier",
+
+    #             "Configuration 4":
+    #                 "Configuration 4 - 1SR, 42U×800W×1200D, 7KW, Dehumidifier",
+    #         }
+
+    #         if labels:
+
+    #             st.session_state.configuration = st.selectbox(
+    #                 "Select Configuration",
+    #                 labels,
+
+    #                 index=(
+    #                     labels.index(
+    #                         st.session_state.configuration
+    #                     )
+    #                     if st.session_state.configuration in labels
+    #                     else 0
+    #                 ),
+
+    #                 format_func=lambda x:
+    #                     configuration_display_names.get(x, x),
+
+    #                 key="configuration_selection",
+    #             )
+
+
+    #     # ========================================================
+    # # 02. PDU SELECTION
+    # # ========================================================
+
+    # with st.container(border=True):
+
+    #     st.markdown(
+    #         '<div class="mdc-card-heading">'
+    #         '<span class="mdc-number">02</span>'
+    #         '<span>PDU SELECTION</span>'
+    #         '</div>',
+    #         unsafe_allow_html=True,
+    #     )
+
+    #     # ----------------------------------------------------
+    #     # PDU TYPES FROM EXCEL
+    #     # ----------------------------------------------------
+
+    #     pdu_type_display = {
+    #         "BASIC": "Basic PDU",
+    #         "METERED": "Metered PDU",
+    #         "SWITCHED": "Switched PDU",
+    #         "MANAGED": "Managed PDU",
+    #     }
+
+    #     excel_pdu_types = []
+
+    #     if not pdus_df.empty:
+    #         excel_pdu_types = [
+    #             x
+    #             for x in (
+    #                 pdus_df["Type"]
+    #                 .astype(str)
+    #                 .str.strip()
+    #                 .str.upper()
+    #                 .unique()
+    #                 .tolist()
+    #             )
+    #             if x
+    #         ]
+
+    #     pdu_types = ["None"] + [
+    #         pdu_type_display.get(
+    #             x,
+    #             f"{x.title()} PDU"
+    #         )
+    #         for x in excel_pdu_types
+    #     ]
+
+    #     # ----------------------------------------------------
+    #     # PDU TYPE + MODEL + QUANTITY
+    #     # ----------------------------------------------------
+
+    #     pdu_col1, pdu_col2, pdu_col3 = st.columns(
+    #         [1.0, 2.0, 0.55],
+    #         gap="small"
+    #     )
+
+    #     # ----------------------------------------------------
+    #     # PDU TYPE
+    #     # ----------------------------------------------------
+
+    #     with pdu_col1:
+
+    #         previous_pdu_type = st.session_state.get(
+    #             "pdu_type_selection",
+    #             "None"
+    #         )
+
+    #         if previous_pdu_type not in pdu_types:
+    #             previous_pdu_type = "None"
+
+    #         selected_pdu_type = st.selectbox(
+    #             "PDU Type",
+    #             pdu_types,
+    #             index=pdu_types.index(previous_pdu_type),
+    #             key="pdu_type_selection",
+    #         )
+
+    #     # ----------------------------------------------------
+    #     # PDU MODEL
+    #     # ----------------------------------------------------
+
+    #     selected_part = None
+
+    #     with pdu_col2:
+
+    #         if selected_pdu_type != "None":
+
+    #             reverse_type = {
+    #                 v: k
+    #                 for k, v in pdu_type_display.items()
+    #             }
+
+    #             excel_pdu_type = reverse_type.get(
+    #                 selected_pdu_type,
+    #                 selected_pdu_type
+    #                 .replace(" PDU", "")
+    #                 .upper(),
+    #             )
+
+    #             filtered_pdus = pdus_df[
+    #                 pdus_df["Type"]
+    #                 .astype(str)
+    #                 .str.strip()
+    #                 .str.upper()
+    #                 == excel_pdu_type
+    #             ].copy()
+
+    #             if not filtered_pdus.empty:
+
+    #                 pdu_options = [
+    #                     f'{clean_text(r["Part Code"])} — '
+    #                     f'{clean_text(r["Description"])}'
+    #                     for _, r in filtered_pdus.iterrows()
+    #                 ]
+
+    #                 old_selection = st.session_state.get(
+    #                     "pdu_model_selection"
+    #                 )
+
+    #                 pdu_index = (
+    #                     pdu_options.index(old_selection)
+    #                     if old_selection in pdu_options
+    #                     else 0
+    #                 )
+
+    #                 selected_pdu = st.selectbox(
+    #                     "Select PDU",
+    #                     pdu_options,
+    #                     index=pdu_index,
+    #                     key="pdu_model_selection",
+    #                 )
+
+    #                 selected_row = filtered_pdus.iloc[
+    #                     pdu_options.index(selected_pdu)
+    #                 ]
+
+    #                 selected_part = clean_text(
+    #                     selected_row["Part Code"]
+    #                 )
+
+    #             else:
+
+    #                 st.warning(
+    #                     f"No {selected_pdu_type} options found "
+    #                     "in MDC_Master_V1.xlsx."
+    #                 )
+
+    #     # ----------------------------------------------------
+    #     # PDU QUANTITY — COMPACT
+    #     # ----------------------------------------------------
+
+    #     with pdu_col3:
+
+    #         if selected_part:
+
+    #             current_pdu_qty = int(
+    #                 numeric(
+    #                     st.session_state.pdu_qty.get(
+    #                         selected_part,
+    #                         1
+    #                     )
+    #                 )
+    #             )
+
+    #             pdu_quantity = st.number_input(
+    #                 "Qty",
+    #                 min_value=1,
+    #                 max_value=999,
+    #                 step=1,
+    #                 value=current_pdu_qty,
+    #                 key=f"pdu_quantity_{selected_part}",
+    #             )
+
+    #             st.session_state.pdu_qty = {
+    #                 selected_part: pdu_quantity
+    #             }
+
+    #         else:
+
+    #             st.number_input(
+    #                 "Qty",
+    #                 min_value=1,
+    #                 max_value=999,
+    #                 value=1,
+    #                 step=1,
+    #                 disabled=True,
+    #                 key="pdu_quantity_none",
+    #             )
+
+    #             st.session_state.pdu_qty = {}
+    # # ============================================================
+    # # RIGHT PANEL
+    # # 03 OTHER ACCESSORIES
+    # # ============================================================
+
+    # with main_right:
+
+    #     with st.container(border=True):
+
+    #         st.markdown(
+    #             '<div class="mdc-card-heading">'
+    #             '<span class="mdc-number">03</span>'
+    #             '<span>OTHER ACCESSORIES</span>'
+    #             '</div>',
+    #             unsafe_allow_html=True,
+    #         )
+
+
+            # ====================================================
+            # ACCESSORY LOOKUP FROM EXCEL
+            # ====================================================
+
+            optional_lookup = {
+                clean_text(r["Part Code"]): r
+                for _, r in accessories_df.iterrows()
+                if clean_text(r["Part Code"])
+            }
+
+
+            def excel_optional_rows(keyword=None):
+                """Find optional items by Excel part number/description."""
+
+                if accessories_df.empty:
+                    return pd.DataFrame()
+
+                if not keyword:
+                    return accessories_df.copy()
+
+                key = str(keyword).upper()
+
+                mask = (
+                    accessories_df["Part Code"]
+                    .astype(str)
+                    .str.upper()
+                    .str.contains(
+                        key,
+                        na=False
+                    )
+                    |
+                    accessories_df["Description"]
+                    .astype(str)
+                    .str.upper()
+                    .str.contains(
+                        key,
+                        na=False
+                    )
                 )
-                camera_qty = st.number_input(
-                    "Qty",
-                    min_value=1,
-                    max_value=999,
-                    value=int(st.session_state.get("camera_quantity", current_camera_qty)),
-                    step=1,
-                    key="camera_quantity",
-                )
-            else:
-                camera_qty = 0
 
-        if camera_selection:
-            add_rows(camera_rows, int(camera_qty))
-        else:
-            remove_rows(camera_rows)
+                return accessories_df[mask].copy()
 
-        # ----------------------------------------------------
-        # OTHER OPTIONAL ACCESSORIES
-        # ----------------------------------------------------
-        other_accessory_keywords = [
-            ("KEYBOARD", "Rotating Keyboard Tray"),
-            ("CABLE MANAGER", "Cable Manager"),
-            ("TOP CABLE TRAY", "Top Cable Tray"),
-            ("BRUSH PANEL", "Brush Panel"),
-        ]
 
-        for keyword, fallback_label in other_accessory_keywords:
-            rows = excel_optional_rows(keyword)
-            if rows.empty:
-                continue
+            def remove_rows(rows):
 
-            for _, r in rows.iterrows():
-                part = clean_text(r["Part Code"])
-                description = clean_text(r["Description"])
-                if not part:
-                    continue
+                for _, r in rows.iterrows():
 
-                current_qty = int(
-                    numeric(st.session_state.accessory_qty.get(part, 0))
-                )
-
-                acc_col1, acc_col2 = st.columns(
-                    [4.5, 1.15], gap="small", vertical_alignment="center"
-                )
-                with acc_col1:
-                    selected = st.checkbox(
-                        description if description else fallback_label,
-                        value=current_qty > 0,
-                        key=f"other_acc_{part}",
+                    part = clean_text(
+                        r["Part Code"]
                     )
 
-                with acc_col2:
-                    if selected:
-                        qty = st.number_input(
-                            "Qty",
-                            min_value=1,
-                            max_value=999,
-                            step=1,
-                            value=current_qty if current_qty > 0 else 1,
-                            key=f"other_qty_{part}",
-                            label_visibility="collapsed",
+                    if part:
+                        st.session_state.accessory_qty.pop(
+                            part,
+                            None
                         )
-                        st.session_state.accessory_qty[part] = qty
-                    else:
-                        st.session_state.accessory_qty.pop(part, None)
 
+
+            def add_rows(rows, quantity=1):
+
+                for _, r in rows.iterrows():
+
+                    part = clean_text(
+                        r["Part Code"]
+                    )
+
+                    if part:
+
+                        st.session_state.accessory_qty[
+                            part
+                        ] = quantity
+
+
+            # ====================================================
+            # FIRE SUPPRESSION
+            # ====================================================
+
+            # st.markdown(
+            #     '<div class="mdc-mini-heading">'
+            #     'Fire Suppression'
+            #     '</div>',
+            #     unsafe_allow_html=True
+            # )
+
+            fire_rows = excel_optional_rows("FIRE")
+
+            external_fire = fire_rows[
+                fire_rows["Description"]
+                .astype(str)
+                .str.upper()
+                .str.contains(
+                    "EXTERNAL",
+                    na=False
+                )
+            ].copy()
+
+            # Everything in the FIRE group that is not explicitly
+            # marked EXTERNAL is treated as an internal/in-rack item.
+            # This is important because some internal Excel descriptions
+            # do not literally contain the word "INTERNAL".
+            internal_fire = fire_rows[
+                ~fire_rows["Description"]
+                .astype(str)
+                .str.upper()
+                .str.contains(
+                    "EXTERNAL",
+                    na=False
+                )
+            ].copy()
+
+            fire_current = "None"
+
+            if any(
+                numeric(
+                    st.session_state.accessory_qty.get(
+                        p,
+                        0
+                    )
+                ) > 0
+                for p in external_fire["Part Code"].astype(str).str.strip()
+            ):
+                fire_current = "External"
+            elif any(
+                numeric(
+                    st.session_state.accessory_qty.get(
+                        p,
+                        0
+                    )
+                ) > 0
+                for p in internal_fire["Part Code"].astype(str).str.strip()
+            ):
+                fire_current = "Internal"
+
+
+            fire_selection = st.radio(
+                "Fire Suppression",
+                ["None", "External", "Internal"],
+
+                index=[
+                    "None",
+                    "External",
+                    "Internal"
+                ].index(fire_current),
+
+                horizontal=True,
+
+                key="fire_suppression_selection",
+            )
+
+
+            remove_rows(external_fire)
+            remove_rows(internal_fire)
+
+
+            if fire_selection == "External":
+
+                add_rows(
+                    external_fire,
+                    1
+                )
+
+            elif fire_selection == "Internal":
+
+                add_rows(
+                    internal_fire,
+                    1
+                )
+
+
+            # ====================================================
+            # CAMERA
+            # ====================================================
+
+            # st.markdown(
+            #     '<div class="mdc-mini-heading">'
+            #     'Camera'
+            #     '</div>',
+            #     unsafe_allow_html=True
+            # )
+
+            all_camera_rows = excel_optional_rows(
+                "CAMERA"
+            )
+
+            # Only the 1TB camera/HDD option is selectable.
+            # Remove any 4TB rows from both the UI and the current session state.
+            four_tb_rows = (
+                all_camera_rows[
+                    all_camera_rows["Description"]
+                    .astype(str)
+                    .str.upper()
+                    .str.contains("4TB", na=False)
+                ].copy()
+                if not all_camera_rows.empty
+                else pd.DataFrame()
+            )
+
+            for _, old_camera_row in four_tb_rows.iterrows():
+                old_part = clean_text(old_camera_row["Part Code"])
+                if old_part:
+                    st.session_state.accessory_qty.pop(old_part, None)
+
+            camera_rows = (
+                all_camera_rows[
+                    ~all_camera_rows["Description"]
+                    .astype(str)
+                    .str.upper()
+                    .str.contains("4TB", na=False)
+                ].copy()
+                if not all_camera_rows.empty
+                else pd.DataFrame()
+            )
+
+            camera_parts = (
+                camera_rows["Part Code"]
+                .astype(str)
+                .str.strip()
+                .tolist()
+                if not camera_rows.empty
+                else []
+            )
+
+
+            camera_current = any(
+                numeric(
+                    st.session_state.accessory_qty.get(
+                        p,
+                        0
+                    )
+                ) > 0
+                for p in camera_parts
+            )
+
+            # Camera uses the same compact row layout as the other accessories.
+            # The Excel-driven component selection remains unchanged.
+            cam_col1, cam_col2 = st.columns(
+                [4.5, 1.15],
+                gap="small",
+                vertical_alignment="center"
+            )
+
+            with cam_col1:
+                camera_selection = st.checkbox(
+                    "Camera",
+                    value=camera_current,
+                    key="camera_system_selection",
+                )
+
+            with cam_col2:
+                if camera_selection:
+                    current_camera_qty = max(
+                        [
+                            int(numeric(st.session_state.accessory_qty.get(p, 0)))
+                            for p in camera_parts
+                            if numeric(st.session_state.accessory_qty.get(p, 0)) > 0
+                        ] + [1]
+                    )
+
+                    camera_qty = st.number_input(
+                        "Qty",
+                        min_value=1,
+                        max_value=999,
+                        value=int(st.session_state.get("camera_quantity", current_camera_qty)),
+                        step=1,
+                        key="camera_quantity",
+                    )
+                else:
+                    camera_qty = 0
+
+            if camera_selection:
+                # Apply the selected quantity to the same Excel-driven camera rows.
+                add_rows(camera_rows, int(camera_qty))
+            else:
+                remove_rows(camera_rows)
+
+
+            # ====================================================
+            # OTHER OPTIONAL ACCESSORIES
+            # ====================================================
+
+            # st.markdown(
+            #     '<div class="mdc-mini-heading">'
+            #     'Optional Accessories'
+            #     '</div>',
+            #     unsafe_allow_html=True
+            # )
+
+            other_accessory_keywords = [
+                (
+                    "KEYBOARD",
+                    "Rotating Keyboard Tray"
+                ),
+                (
+                    "CABLE MANAGER",
+                    "Cable Manager"
+                ),
+                (
+                    "TOP CABLE TRAY",
+                    "Top Cable Tray"
+                ),
+                (
+                    "BRUSH PANEL",
+                    "Brush Panel"
+                ),
+            ]
+
+
+            for keyword, fallback_label in other_accessory_keywords:
+
+                rows = excel_optional_rows(
+                    keyword
+                )
+
+                if rows.empty:
+                    continue
+
+
+                for _, r in rows.iterrows():
+
+                    part = clean_text(
+                        r["Part Code"]
+                    )
+
+                    description = clean_text(
+                        r["Description"]
+                    )
+
+                    if not part:
+                        continue
+
+
+                    current_qty = int(
+                        numeric(
+                            st.session_state.accessory_qty.get(
+                                part,
+                                0
+                            )
+                        )
+                    )
+
+
+                    acc_col1, acc_col2 = st.columns(
+                        [4.5, 1.15],
+                        gap="small",
+                        vertical_alignment="center"
+                    )
+
+
+                    with acc_col1:
+
+                        selected = st.checkbox(
+                            description
+                            if description
+                            else fallback_label,
+
+                            value=current_qty > 0,
+
+                            key=f"other_acc_{part}",
+                        )
+
+
+                    with acc_col2:
+
+                        if selected:
+
+                            qty = st.number_input(
+                                "Qty",
+
+                                min_value=1,
+                                max_value=999,
+                                step=1,
+
+                                value=(
+                                    current_qty
+                                    if current_qty > 0
+                                    else 1
+                                ),
+
+                                key=f"other_qty_{part}",
+
+                                label_visibility="collapsed",
+                            )
+
+                            st.session_state.accessory_qty[
+                                part
+                            ] = qty
+
+                        else:
+
+                            st.session_state.accessory_qty.pop(
+                                part,
+                                None
+                            )
+
+else:
+    # ========================================================
+    # MULTIRACK COMMON COMPONENTS
+    # B/C rows are common across the nine solutions.
+    # They are shown once and selected with checkboxes.
+    # ========================================================
+    with main_right:
+        with st.container(border=True):
+            st.markdown(
+                '<div class="mdc-card-heading">'
+                '<span class="mdc-number">03</span>'
+                '<span>COMMON COMPONENTS</span>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+            common_rows = selected_multirack_common_components()
+
+            if common_rows.empty:
+                if not os.path.exists(MULTIRACK_FILE):
+                    st.warning(
+                        "MULTIRACK BOQ.xlsx was not found in the app folder."
+                    )
+                else:
+                    st.info(
+                        "No common B/C components were found in "
+                        "Multi Rack config-1."
+                    )
+            else:
+                st.caption(
+                    "These B and C components are common to the Multirack "
+                    "solutions. Select the items required for this configuration."
+                )
+
+                for _, mr in common_rows.iterrows():
+                    selection_key = clean_text(
+                        mr.get("Common Selection Key")
+                    )
+                    description = clean_text(mr.get("Description"))
+                    qty = numeric(mr.get("Quantity"))
+                    uom = clean_text(mr.get("UOM")) or "EA"
+
+                    if not description:
+                        continue
+
+                    qty_text = (
+                        f"{qty:g}" if pd.notna(qty) else ""
+                    )
+                    label = description
+                    if qty_text:
+                        label = f"{description} ({qty_text} {uom})"
+
+                    selected = st.checkbox(
+                        label,
+                        value=bool(
+                            st.session_state.multirack_common_selected.get(
+                                selection_key,
+                                False,
+                            )
+                        ),
+                        key=f"mr_common_{selection_key}",
+                    )
+
+                    st.session_state.multirack_common_selected[
+                        selection_key
+                    ] = selected
 
 # ============================================================
-# END MAIN CONFIGURATION AREA
-# ============================================================
-
-
 # LIVE USER CODE UPDATE
 # ============================================================
 # Generate the code after all current UI selections have been processed.
 # The placeholder above keeps the panel in the same compact top position.
 st.session_state.user_code = generate_user_code()
 render_user_info_panel(user_info_placeholder)
+
+# ============================================================
+# 5. FINAL BOQ
 
 # ============================================================
 # 5. FINAL BOQ
@@ -3961,15 +4722,7 @@ margin_pct = float(st.session_state.margin_pct)
 freight = float(st.session_state.freight)
 installation = float(st.session_state.installation)
 
-if st.session_state.mdc_type == "Multirack":
-    bom_with_price, margin_price, final_selling_price = add_selling_prices(
-        bom,
-        total_cost,
-        margin_pct,
-        freight,
-        installation,
-    )
-elif not bom.empty:
+if not bom.empty:
     bom_with_price, margin_price, final_selling_price = add_selling_prices(
         bom,
         total_cost,
@@ -4145,104 +4898,87 @@ with st.expander("▼ Show Final BOQ", expanded=False):
 # ============================================================
 
 if is_internal:
-
     section_header("6. COST SUMMARY — INTERNAL ONLY")
 
     a, b, c, d = st.columns(4)
 
-    if st.session_state.mdc_type == "Multirack":
+    with a:
+        price_box("Base Cost", base_cost)
 
-        with a:
-            price_box("Base Cost", float("nan"))
+    with b:
+        price_box("Optional Cost", optional_cost)
 
-        with b:
-            price_box("Optional Cost", float("nan"))
+    with c:
+        price_box("PDU Cost", pdu_cost)
 
-        with c:
-            price_box("PDU Cost", float("nan"))
+    with d:
+        price_box("Total Cost", total_cost)
 
-        with d:
-            price_box("Total Cost", float("nan"))
+    section_header("7. COST TO SELLING PRICE — INTERNAL ONLY")
 
-    else:
+    p1, p2, p3, p4 = st.columns(4)
 
-        with a:
-            price_box("Base Cost", base_cost)
-
-        with b:
-            price_box("Optional Cost", optional_cost)
-
-        with c:
-            price_box("PDU Cost", pdu_cost)
-
-        with d:
-            price_box("Total Cost", total_cost)
-
-        section_header("7. COST TO SELLING PRICE — INTERNAL ONLY")
-
-        p1, p2, p3, p4 = st.columns(4)
-
-        with p1:
-            st.session_state.margin_pct = st.number_input(
-                "Margin (%)",
-                min_value=0.0,
-                max_value=99.0,
-                value=float(st.session_state.margin_pct),
-                step=0.5,
-            )
-
-        with p2:
-            st.session_state.freight = st.number_input(
-                "Freight",
-                min_value=0.0,
-                value=float(st.session_state.freight),
-                step=500.0,
-            )
-
-        with p3:
-            st.session_state.installation = st.number_input(
-                "Installation",
-                min_value=0.0,
-                value=float(st.session_state.installation),
-                step=500.0,
-            )
-
-        with p4:
-            st.session_state.warranty_pct = st.number_input(
-                "Warranty (%)",
-                min_value=0.0,
-                max_value=100.0,
-                value=float(st.session_state.warranty_pct),
-                step=0.5,
-            )
-
-        margin_pct = float(st.session_state.margin_pct)
-        freight = float(st.session_state.freight)
-        installation = float(st.session_state.installation)
-        warranty_pct = float(st.session_state.warranty_pct)
-
-        margin_price = (
-            total_cost / (1 - margin_pct / 100)
-            if margin_pct < 100
-            else 0.0
+    with p1:
+        st.session_state.margin_pct = st.number_input(
+            "Margin (%)",
+            min_value=0.0,
+            max_value=99.0,
+            value=float(st.session_state.margin_pct),
+            step=0.5,
         )
 
-        final_selling_price = margin_price + freight + installation
-        warranty_amount = margin_price * warranty_pct / 100
+    with p2:
+        st.session_state.freight = st.number_input(
+            "Freight",
+            min_value=0.0,
+            value=float(st.session_state.freight),
+            step=500.0,
+        )
 
-        a, b, c, d = st.columns(4)
+    with p3:
+        st.session_state.installation = st.number_input(
+            "Installation",
+            min_value=0.0,
+            value=float(st.session_state.installation),
+            step=500.0,
+        )
 
-        with a:
-            price_box("Margin Price", margin_price)
+    with p4:
+        st.session_state.warranty_pct = st.number_input(
+            "Warranty (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(st.session_state.warranty_pct),
+            step=0.5,
+        )
 
-        with b:
-            price_box("After Freight", margin_price + freight)
+    margin_pct = float(st.session_state.margin_pct)
+    freight = float(st.session_state.freight)
+    installation = float(st.session_state.installation)
+    warranty_pct = float(st.session_state.warranty_pct)
 
-        with c:
-            price_box("Final Selling Price", final_selling_price)
+    margin_price = (
+        total_cost / (1 - margin_pct / 100)
+        if margin_pct < 100
+        else 0.0
+    )
 
-        with d:
-            price_box("Warranty Amount", warranty_amount)
+    final_selling_price = margin_price + freight + installation
+    warranty_amount = margin_price * warranty_pct / 100
+
+    a, b, c, d = st.columns(4)
+
+    with a:
+        price_box("Margin Price", margin_price)
+
+    with b:
+        price_box("After Freight", margin_price + freight)
+
+    with c:
+        price_box("Final Selling Price", final_selling_price)
+
+    with d:
+        price_box("Warranty Amount", warranty_amount)
 
 
 # ============================================================
@@ -4252,30 +4988,17 @@ if is_internal:
 section_header("8. DOWNLOADS")
 
 if not bom.empty:
-    if st.session_state.mdc_type == "Multirack":
-        internal_cost_data = [
-            ["Base Cost", None],
-            ["Optional Cost", None],
-            ["PDU Cost", None],
-            ["Total Cost", None],
-            ["Margin %", None],
-            ["Margin Price", None],
-            ["Freight", None],
-            ["Installation", None],
-            ["Final Selling Price", None],
-        ]
-    else:
-        internal_cost_data = [
-            ["Base Cost", base_cost],
-            ["Optional Cost", optional_cost],
-            ["PDU Cost", pdu_cost],
-            ["Total Cost", total_cost],
-            ["Margin %", margin_pct],
-            ["Margin Price", margin_price],
-            ["Freight", freight],
-            ["Installation", installation],
-            ["Final Selling Price", final_selling_price],
-        ]
+    internal_cost_data = [
+        ["Base Cost", base_cost],
+        ["Optional Cost", optional_cost],
+        ["PDU Cost", pdu_cost],
+        ["Total Cost", total_cost],
+        ["Margin %", margin_pct],
+        ["Margin Price", margin_price],
+        ["Freight", freight],
+        ["Installation", installation],
+        ["Final Selling Price", final_selling_price],
+    ]
 
     sales_excel = excel_bytes(
         internal=False,
@@ -4352,13 +5075,13 @@ else:
 
 
 # ============================================================
-# 9. USER HISTORY
+# 10. USER HISTORY
 # INTERNAL USERS ONLY
 # ============================================================
 
 if is_internal:
 
-    section_header("9. CONFIGURATION HISTORY")
+    section_header("10. CONFIGURATION HISTORY")
 
     conn = sqlite3.connect(TRACKING_DB)
 
@@ -4387,6 +5110,93 @@ if is_internal:
     else:
 
         st.info("No user history available yet.")
+
+# # ============================================================
+
+# # 9. SAVE CONFIGURATION
+# # ============================================================
+
+# section_header("9. SAVE CONFIGURATION")
+
+# save_col1, save_col2 = st.columns([2, 5])
+
+# with save_col1:
+#     if st.button(
+#         "💾 Save Configuration",
+#         use_container_width=True,
+#         type="primary",
+#     ):
+#         current_margin_price = (
+#             total_cost / (1 - margin_pct / 100)
+#             if margin_pct < 100
+#             else 0.0
+#         )
+
+#         current_final_price = (
+#             current_margin_price + freight + installation
+#         )
+
+#         current_warranty_amount = (
+#             current_margin_price * warranty_pct / 100
+#         )
+
+#         save_configuration(
+#             configuration_id=st.session_state.configuration_id,
+#             bom=bom_with_price,
+#             base_cost=base_cost,
+#             optional_cost=optional_cost,
+#             pdu_cost=pdu_cost,
+#             total_cost=total_cost,
+#             margin_pct=margin_pct,
+#             freight=freight,
+#             installation=installation,
+#             warranty_pct=warranty_pct,
+#             margin_price=current_margin_price,
+#             final_selling_price=current_final_price,
+#             warranty_amount=current_warranty_amount,
+#         )
+
+#         st.session_state.configuration_saved = True
+
+#         st.success(
+#             "Configuration saved successfully."
+#         )
+
+
+# # ============================================================
+# # 10. CONFIGURATION HISTORY
+# # INTERNAL USERS ONLY
+# # ============================================================
+
+# if is_internal:
+#     section_header("10. CONFIGURATION HISTORY")
+
+#     conn = sqlite3.connect(TRACKING_DB)
+
+#     history_df = pd.read_sql_query(
+#         """
+#         SELECT
+#             COALESCE(NULLIF(user_code, ''), '—') AS "User Code",
+#             customer_name AS "Customer Name",
+#             DATE(created_at) AS "Date"
+#         FROM configurations
+#         ORDER BY id DESC
+#         """,
+#         conn,
+#     )
+
+#     conn.close()
+
+#     if not history_df.empty:
+#         st.dataframe(
+#             history_df,
+#             use_container_width=True,
+#             hide_index=True,
+#             height=220,
+#         )
+#     else:
+#         st.info("No saved configurations available yet.")
+
 
 # ============================================================
 # FOOTER
