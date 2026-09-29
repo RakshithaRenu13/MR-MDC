@@ -76,7 +76,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MASTER_FILE = os.path.join(BASE_DIR, "MDC_Master_V1 (2).xlsx")
+MASTER_FILE = os.path.join(BASE_DIR, "MDC_Master_V1.xlsx")
 MULTIRACK_FILE = os.path.join(BASE_DIR, "MULTIRACK BOQ.xlsx")
 MULTIRACK_SHEET = "Multi Rack config-1"
 TRACKING_DB = os.path.join(BASE_DIR, "MDC_Tracking.db")
@@ -707,11 +707,13 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
                     if not vals:
                         continue
 
-                    # Category headings change the group for following rows.
+                    # Category headings normally change the group for following rows.
+                    # Some Multirack BOQ rows, however, contain the category marker
+                    # AND a component description on the SAME Excel row.  Do not
+                    # discard such a row; update the group and continue parsing it.
                     detected_group = detect_group(row)
                     if detected_group:
                         current_group = detected_group
-                        continue
 
                     # Ignore repeated column headings.
                     normalized = {norm(v) for v in vals}
@@ -731,6 +733,38 @@ def load_master(master_mtime=0.0, multirack_mtime=0.0):
                     part = cell_at("part")
                     cost_raw = cell_at("cost")
 
+                    # Some Category B/C headings share their row with the
+                    # component line.  In that case the normal Description
+                    # cell can contain only "B", "Category B", "C", etc.
+                    # Find the actual component description from the other
+                    # populated cells on that same row.
+                    desc_norm = norm(desc)
+                    if (
+                        not desc
+                        or desc_norm in {"A", "B", "C", "CATEGORYA", "CATEGORYB", "CATEGORYC", "GROUPA", "GROUPB", "GROUPC"}
+                    ):
+                        category_norms = {
+                            "A", "B", "C",
+                            "CATEGORYA", "CATEGORYB", "CATEGORYC",
+                            "GROUPA", "GROUPB", "GROUPC",
+                        }
+                        candidates = []
+                        for value in row_values(row):
+                            value_norm = norm(value)
+                            if not value or value_norm in category_norms:
+                                continue
+                            if value_norm in {"SNO", "DESCRIPTION", "QTY", "QUANTITY", "UOM", "UNIT", "PART", "PARTCODE", "PARTNO", "COST", "PRICE"}:
+                                continue
+                            candidates.append(value)
+
+                        # Prefer a populated value that is not the numeric
+                        # quantity/UOM/part value. The first remaining text
+                        # value is the component description.
+                        if candidates:
+                            desc = candidates[0]
+
+                    # If the normal description cell is present but the row
+                    # also contains the category marker, it is still valid.
                     # Only actual BOQ lines are collected.
                     if not desc:
                         continue
@@ -1009,28 +1043,54 @@ def price_box(label, value):
 # ============================================================
 
 def generate_user_code():
-    """Generate the user code entirely from the current Excel-driven selections."""
+    """Generate the user code from the current configuration and selections.
+
+    Single Rack codes remain exactly as before.  Multirack adds its own
+    solution/component codes first, then uses the same existing PDU and
+    Other Accessories code logic as Single Rack.
+    """
     codes = []
 
-    config_text = clean_text(st.session_state.configuration)
-    if config_text:
-        number = config_text.split()[-1]
-        codes.append(f"C{number}")
-
-    # Multirack uses the selected solution number plus common selections.
-    # The component list itself is Excel-driven and does not use the
-    # Single Rack accessory/PDU code mapping.
+    # --------------------------------------------------------
+    # MULTIRACK
+    # --------------------------------------------------------
     if st.session_state.mdc_type == "Multirack":
-        selected_common_count = sum(
-            1
-            for value in st.session_state.multirack_common_selected.values()
-            if value
-        )
-        if selected_common_count:
-            codes.append(f"MR{selected_common_count}")
-        return "-".join(codes) if codes else "—"
+        # Selected solution 1-9 -> MR-1 ... MR-9.
+        config_text = clean_text(st.session_state.configuration)
+        match = re.search(r"(\d+)", config_text)
+        if match:
+            solution_number = int(match.group(1))
+            if 1 <= solution_number <= 9:
+                codes.append(f"MR-{solution_number}")
 
-    # Fire suppression is detected from Excel descriptions.
+        # Five common B/C components are assigned stable C1-C5 codes
+        # according to their Excel/display order.  Only selected items
+        # receive a code.  B and C remain separate categories.
+        common_pool = selected_multirack_common_components()
+        if not common_pool.empty:
+            for component_number, (_, row) in enumerate(common_pool.iterrows(), start=1):
+                if component_number > 5:
+                    break
+                selection_key = clean_text(row.get("Common Selection Key"))
+                if selection_key and st.session_state.multirack_common_selected.get(selection_key, False):
+                    codes.append(f"C{component_number}")
+
+        # IMPORTANT: do NOT return here.  Multirack must use the exact
+        # existing Single Rack PDU and Other Accessories code mappings.
+
+    # --------------------------------------------------------
+    # SINGLE RACK CONFIGURATION CODE
+    # --------------------------------------------------------
+    else:
+        config_text = clean_text(st.session_state.configuration)
+        if config_text:
+            number = config_text.split()[-1]
+            codes.append(f"C{number}")
+
+    # --------------------------------------------------------
+    # EXISTING FIRE / CAMERA / OTHER ACCESSORY CODES
+    # Kept unchanged so Multirack and Single Rack use the same codes.
+    # --------------------------------------------------------
     fire_selected = []
     for part, qty in st.session_state.accessory_qty.items():
         if numeric(qty) <= 0:
@@ -1048,7 +1108,6 @@ def generate_user_code():
     elif fire_selected:
         codes.append("F-INT")
 
-    # Camera is detected from Excel descriptions, not hardcoded part numbers.
     camera_selected = False
     for part, qty in st.session_state.accessory_qty.items():
         if numeric(qty) <= 0:
@@ -1063,7 +1122,6 @@ def generate_user_code():
     if camera_selected:
         codes.append("CAM")
 
-    # Other accessory codes are detected by their Excel descriptions.
     accessory_code_map = [
         ("KEYBOARD", "KT"),
         ("CABLE MANAGER", "CM"),
@@ -1085,9 +1143,9 @@ def generate_user_code():
         if selected:
             codes.append(code)
 
-    # PDU code is obtained separately from Excel TYPE for every
-    # selected PDU component. This avoids one common PDU code being
-    # used for all PDU types/components.
+    # --------------------------------------------------------
+    # EXISTING PDU CODE LOGIC — unchanged
+    # --------------------------------------------------------
     pdu_map = {
         "BASIC": "B-PDU",
         "METERED": "M-PDU",
@@ -1095,10 +1153,6 @@ def generate_user_code():
         "MANAGED": "MG-PDU",
     }
 
-    # Each PDU model gets its own unique user-code suffix based on
-    # its position within that PDU type in the Excel master.
-    # Example: the 4 Basic PDU models become B-PDU1, B-PDU2,
-    # B-PDU3 and B-PDU4. Metered/Switched/Managed follow the same rule.
     for part, qty in st.session_state.pdu_qty.items():
         if numeric(qty) <= 0:
             continue
@@ -1116,7 +1170,6 @@ def generate_user_code():
         if not pdu_prefix:
             continue
 
-        # Preserve Excel order so each model has a stable unique number.
         same_type = pdus_df[
             pdus_df["Type"].astype(str).str.strip().str.upper() == pdu_type
         ].reset_index(drop=True)
