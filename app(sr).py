@@ -77,7 +77,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MASTER_FILE = os.path.join(BASE_DIR, "MDC_Master_V1.xlsx")
+MASTER_FILE = os.path.join(BASE_DIR, "1 Rack SKU_S - MDC BOQ (01.09.2026).xlsx")
 MULTIRACK_FILE = os.path.join(BASE_DIR, "MULTIRACK BOQ.xlsx")
 MULTIRACK_SHEET = "Multi Rack config-1"
 TRACKING_DB = os.path.join(BASE_DIR, "MDC_Tracking.db")
